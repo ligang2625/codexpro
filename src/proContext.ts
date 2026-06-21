@@ -8,6 +8,10 @@ import { CodexProError, PathGuard, normalizeRelPath } from "./guard.js";
 import { listFiles, readTextFile, repoTree, writeTextFile, ensureAiBridge } from "./fsOps.js";
 import { gitDiff, gitLog, gitStatus } from "./gitOps.js";
 import { readAiBridgeContext } from "./workspaceOps.js";
+import {
+  formatWebgptInstructionsForContext,
+  readWebgptInstructions
+} from "./webgptInstructions.js";
 import { redactSensitiveText } from "./redact.js";
 
 export interface ProContextOptions {
@@ -37,7 +41,6 @@ export interface ProContextResult {
 const IMPORTANT_ROOT_FILES = [
   "AGENTS.md",
   "README.md",
-  "CLAUDE.md",
   "package.json",
   "pnpm-workspace.yaml",
   "yarn.lock",
@@ -220,6 +223,18 @@ export async function buildProContext(
 
   appendSection(parts, "Git Status", `\`\`\`text\n${status}\n\`\`\``);
   appendSection(parts, "Recent Commits", `\`\`\`text\n${gitLog(config, workspace, 8)}\n\`\`\``);
+  
+  const webgpt = await readWebgptInstructions(config, guard, workspace, {
+    maxDepth: 4,
+    maxFileBytes: Math.min(maxFileBytes, 60_000),
+    maxTotalBytes: Math.min(config.maxReadBytes, 120_000)
+  });
+  appendSection(
+    parts,
+    "WebGPT Instructions",
+    formatWebgptInstructionsForContext(webgpt)
+  );
+  filesIncluded.push(...webgpt.files);
 
   if (options.includeDiff !== false) {
     const diff = truncateText(gitDiff(config, guard, workspace), maxDiffBytes);
@@ -292,7 +307,7 @@ export async function buildProContext(
   return {
     markdown,
     bytes: Buffer.byteLength(markdown, "utf8"),
-    filesIncluded,
+    filesIncluded: unique(filesIncluded),
     filesSkipped,
     truncated
   };
