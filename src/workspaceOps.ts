@@ -9,13 +9,26 @@ import { readTextFile, repoTree, ensureAiBridge } from "./fsOps.js";
 import { gitDiff, gitLog, gitStatus } from "./gitOps.js";
 import { discoverSkillInventory } from "./capabilitiesOps.js";
 import type { SkillInventoryItem } from "./capabilitiesOps.js";
+import {
+  WEBGPT_INSTRUCTIONS_PATH,
+  findWebgptInstructionsPath,
+  formatWebgptInstructionsForContext,
+  readWebgptInstructions
+} from "./webgptInstructions.js";
 
 export interface WorkspaceSummary {
   text: string;
   workspaceId: string;
   root: string;
+
   agentsLoaded: boolean;
   agentsPath?: string;
+
+  webgptLoaded: boolean;
+  webgptPath?: string;
+  webgptFiles: string[];
+  webgptWarnings: string[];
+
   skills: string[];
   skillInventory: SkillInventoryItem[];
   skillCounts: Record<string, number>;
@@ -28,6 +41,11 @@ export interface CodexContext {
   workspaceId: string;
   root: string;
   targetPath: string;
+
+  webgptFiles: string[];
+  webgptWarnings: string[];
+  webgptLoaded: boolean;
+
   agentsFiles: string[];
   aiContextFiles: string[];
   gitStatus?: string;
@@ -159,12 +177,22 @@ export async function workspaceSummary(
     : [];
   const skills = skillInventory.map((skill) => skill.name);
   const counts = skillCounts(skillInventory);
+  const webgptPath = await findWebgptInstructionsPath(guard, workspace);
+  
+  let webgptText =
+  `  WebGPT instructions: none loaded (${WEBGPT_INSTRUCTIONS_PATH} not found).`;
+  if (webgptPath) {
+    webgptText =
+    `  WebGPT instructions: ${webgptPath} found. ` +
+      "Call codex_context to load expanded WebGPT instructions before editing. " +
+      "CodexPro does not load CLAUDE.md by default.";
+  }
   const agentsPath = await findAgentsFile(workspace);
   let agentsText = "AGENTS.md: none loaded";
   if (agentsPath) {
     agentsText = `AGENTS.md: ${agentsPath} (read this file before editing or making project decisions).`;
   }
-
+  
   let treeText: string | undefined;
   if (options.includeTree !== false) {
     const tree = await repoTree(config, guard, workspace, {
@@ -181,14 +209,21 @@ export async function workspaceSummary(
   const skillText = options.includeSkills
     ? `Skills: ${counts.total} total (${counts.workspace ?? 0} workspace, ${counts.user ?? 0} user, ${counts.plugin ?? 0} plugin, ${counts.other ?? 0} other).`
     : "Skills: skipped. Pass include_skills=true if skill discovery is needed.";
-  const text = `# Workspace\n\nWorkspace: ${workspace.id}\nRoot: ${workspace.root}\nBash mode: ${config.bashMode}\nWrite mode: ${config.writeMode}\nTool mode: ${config.toolMode}\n\n${agentsText}\n${skillText}\n\n## Git status\n\n${status}\n\n## Recent commits\n\n${log}\n${treeText ? `\n## Files\n\n${treeText}` : ""}`;
+  const text = `# Workspace\n\nWorkspace: ${workspace.id}\nRoot: ${workspace.root}\nBash mode: ${config.bashMode}\nWrite mode: ${config.writeMode}\nTool mode: ${config.toolMode}\n\n${webgptText}\n${agentsText}\n${skillText}\n\n## Git status\n\n${status}\n\n## Recent commits\n\n${log}\n${treeText ? `\n## Files\n\n${treeText}` : ""}`;
 
   return {
     text,
     workspaceId: workspace.id,
     root: workspace.root,
+
     agentsLoaded: Boolean(agentsPath),
     agentsPath,
+
+    webgptLoaded: Boolean(webgptPath),
+    webgptPath,
+    webgptFiles: webgptPath ? [webgptPath] : [],
+    webgptWarnings: [],
+
     skills,
     skillInventory,
     skillCounts: counts,
@@ -251,7 +286,23 @@ export async function readCodexContext(
 ): Promise<CodexContext> {
   const targetPath = options.targetPath ?? ".";
   guard.resolve(workspace, targetPath);
-  const agents = await readAgentsChain(config, guard, workspace, targetPath, Math.min(options.maxAgentBytes ?? 60_000, config.maxReadBytes));
+  const maxInstructionBytes = Math.min(
+    options.maxAgentBytes ?? 60_000,
+    config.maxReadBytes
+  );
+  const webgpt = await readWebgptInstructions(config, guard, workspace, {
+    maxDepth: 4,
+    maxFileBytes: maxInstructionBytes,
+    maxTotalBytes: Math.min(config.maxReadBytes, 120_000)
+  });
+  const webgptText = formatWebgptInstructionsForContext(webgpt);
+  const agents = await readAgentsChain(
+    config,
+    guard,
+    workspace,
+    targetPath,
+    maxInstructionBytes
+  );
   const ai = options.includeAiBridge === false
     ? { text: "Skipped by request.", files: [] }
     : await readAiBridgeContext(config, guard, workspace);
@@ -267,6 +318,10 @@ export async function readCodexContext(
     `Bash mode: ${config.bashMode}`,
     `Write mode: ${config.writeMode}`,
     `Tool mode: ${config.toolMode}`,
+    "",
+    "## WebGPT Instructions",
+    "",
+    webgptText,
     "",
     "## AGENTS Instructions",
     "",
@@ -284,6 +339,11 @@ export async function readCodexContext(
     workspaceId: workspace.id,
     root: workspace.root,
     targetPath,
+  
+    webgptFiles: webgpt.files,
+    webgptWarnings: webgpt.warnings,
+    webgptLoaded: webgpt.found,
+  
     agentsFiles: agents.files,
     aiContextFiles: ai.files,
     gitStatus: status,
