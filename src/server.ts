@@ -212,6 +212,7 @@ const STANDARD_TOOL_NAMES = [
   "tree",
   "search",
   "load_skill",
+  "codex_context",
   "read_handoff",
   "export_pro_context",
   "handoff_to_agent"
@@ -290,7 +291,7 @@ function serverInstructions(config: CodexProConfig): string {
     "",
     "Preferred workflow:",
     "1. Start with open_current_workspace. Use open_workspace only when the user gives a different root or asks to switch folders.",
-    "2. Follow any AGENTS.md-style instructions returned by the workspace open call before editing files.",
+    "2. If .claude/WEBGPT.md is present, call codex_context and follow its WebGPT instructions before editing files. Do not read or rely on CLAUDE.md unless the user explicitly asks for it.",
     "3. Inspect with tree, search, and read. Do not use bash for git status, git diff, cat, sed, grep, rg, find, ls, or file reading.",
     "4. Edit with write/edit. After edits, call show_changes once for git status, diff stats, and review diff.",
     "5. Use bash only for meaningful verification commands such as npm test, npm run build, lint, typecheck, or an existing project script.",
@@ -969,6 +970,10 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         root: summary.root,
         agents_loaded: summary.agentsLoaded,
         agents_path: summary.agentsPath,
+        webgpt_loaded: summary.webgptLoaded,
+        webgpt_path: summary.webgptPath,
+        webgpt_files: summary.webgptFiles,
+        webgpt_warnings: summary.webgptWarnings,
         skills: summary.skills,
         skill_inventory: summary.skillInventory,
         skill_counts: summary.skillCounts,
@@ -988,7 +993,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     {
       title: "Open Workspace",
       description:
-        "Open a local project directory as a CodexPro workspace. Returns a workspace_id plus git status, AGENTS.md, skills, and a compact file tree.",
+        "Open a local project directory as a CodexPro workspace. Returns a workspace_id plus git status, WebGPT instruction status, AGENTS.md, skills, and a compact file tree.",
       inputSchema: {
         root: z.string().optional().describe("Project directory to open. Omit to use CODEXPRO_ROOT/current working directory. Supports ~/ paths."),
         path: z.string().optional().describe("Alias for root. Useful for clients that naturally send path instead of root."),
@@ -1024,6 +1029,10 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         root: summary.root,
         agents_loaded: summary.agentsLoaded,
         agents_path: summary.agentsPath,
+        webgpt_loaded: summary.webgptLoaded,
+        webgpt_path: summary.webgptPath,
+        webgpt_files: summary.webgptFiles,
+        webgpt_warnings: summary.webgptWarnings,
         skills: summary.skills,
         skill_inventory: summary.skillInventory,
         skill_counts: summary.skillCounts,
@@ -1499,14 +1508,14 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     {
       title: "Codex Context",
       description:
-        "Load Codex-style workspace context in one call: AGENTS instructions for a target path, .ai-bridge handoff files, and optional git status/diff.",
+        "Load workspace context in one call: WebGPT instructions from .claude/WEBGPT.md with simple @file.md imports, AGENTS instructions for a target path, .ai-bridge handoff files, and optional git status/diff. Does not load CLAUDE.md.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use default workspace."),
-        target_path: z.string().optional().describe("Workspace-relative file or directory whose AGENTS instruction chain should be loaded. Default: ."),
+        target_path: z.string().optional().describe("Workspace-relative file or directory whose AGENTS instruction chain should be loaded. WebGPT instructions always come from .claude/WEBGPT.md. Default: ."),
         include_ai_bridge: z.boolean().optional().describe("Include .ai-bridge plan, agent status, diff, decisions, questions, and execution log. Default: true."),
         include_git: z.boolean().optional().describe("Include git status. Default: true."),
         include_diff: z.boolean().optional().describe("Include full git diff. Default: false for speed/noise."),
-        max_agent_bytes: z.number().int().min(1000).max(200000).optional().describe("Maximum bytes per AGENTS file. Default: 60000.")
+        max_agent_bytes: z.number().int().min(1000).max(200000).optional().describe("Maximum bytes per AGENTS/WebGPT instruction file. Default: 60000.")
       },
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
@@ -1528,6 +1537,9 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         workspace_id: context.workspaceId,
         root: context.root,
         target_path: context.targetPath,
+        webgpt_loaded: context.webgptLoaded,
+        webgpt_files: context.webgptFiles,
+        webgpt_warnings: context.webgptWarnings,
         agents_files: context.agentsFiles,
         ai_context_files: context.aiContextFiles,
         included_git_status: context.gitStatus !== undefined,
