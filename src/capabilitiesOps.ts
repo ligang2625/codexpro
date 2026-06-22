@@ -396,7 +396,7 @@ export async function loadSkill(
     references: referenceResult.references,
     warnings: referenceResult.warnings
   };
-
+}
 function parseTomlMcpServers(text: string, source: string): McpServerInventoryItem[] {
   const out: McpServerInventoryItem[] = [];
   const re = /^\s*\[(?:mcp_servers|mcpServers)\.("?)([^"\].]+)\1\]\s*$/gm;
