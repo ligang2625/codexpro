@@ -16,12 +16,22 @@ interface SkillInventoryRecord extends SkillInventoryItem {
   absPath: string;
 }
 
+export interface SkillReferenceFile {
+  path: string;
+  text: string;
+  bytes: number;
+  totalBytes: number;
+  truncated: boolean;
+}
+
 export interface LoadedSkill {
   skill: SkillInventoryItem;
   text: string;
   bytes: number;
   totalBytes: number;
   truncated: boolean;
+  references: SkillReferenceFile[];
+  warnings: string[];
 }
 
 export interface McpServerInventoryItem {
@@ -92,6 +102,128 @@ function displayPath(absPath: string, workspaceRoot: string): string {
   return absPath;
 }
 
+function isInsideDir(parent: string, child: string): boolean {
+  const rel = path.relative(parent, child);
+  return rel === "" || (!!rel && !rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function findMarkdownFiles(
+  root: string,
+  maxDepth: number,
+  out: string[],
+  maxItems: number
+): Promise<void> {
+  if (out.length >= maxItems || maxDepth < 0) return;
+
+  const entries = await safeReaddir(root);
+
+  for (const entry of entries) {
+    if (out.length >= maxItems) return;
+
+    if (
+      entry.name === "node_modules" ||
+      entry.name === ".git" ||
+      entry.name === "dist" ||
+      entry.name === "build"
+    ) {
+      continue;
+    }
+
+    const abs = path.join(root, entry.name);
+
+    if (entry.isFile() && entry.name.toLowerCase().endsWith(".md")) {
+      out.push(abs);
+      continue;
+    }
+
+    if (entry.isDirectory()) {
+      await findMarkdownFiles(abs, maxDepth - 1, out, maxItems);
+    }
+  }
+}
+
+async function loadSkillReferenceFiles(
+  skill: SkillInventoryRecord,
+  workspaceRoot: string,
+  options: {
+    includeReferences?: boolean;
+    maxReferenceBytes?: number;
+    maxReferences?: number;
+  } = {}
+): Promise<{ references: SkillReferenceFile[]; warnings: string[] }> {
+  if (!options.includeReferences) {
+    return { references: [], warnings: [] };
+  }
+
+  const maxReferences = Math.max(0, Math.min(options.maxReferences ?? 20, 100));
+  if (maxReferences === 0) {
+    return { references: [], warnings: [] };
+  }
+
+  const maxReferenceBytes = Math.max(
+    1_000,
+    Math.min(options.maxReferenceBytes ?? 20_000, 100_000)
+  );
+
+  const skillDir = path.dirname(skill.absPath);
+  const referencesDir = path.join(skillDir, "references");
+
+  if (!fs.existsSync(referencesDir)) {
+    return { references: [], warnings: [] };
+  }
+
+  const warnings: string[] = [];
+  const references: SkillReferenceFile[] = [];
+  const referenceFiles: string[] = [];
+
+  await findMarkdownFiles(referencesDir, 4, referenceFiles, maxReferences);
+
+  let realSkillDir = "";
+  try {
+    realSkillDir = await fsp.realpath(skillDir);
+  } catch (error) {
+    return {
+      references: [],
+      warnings: [
+        `Failed to resolve skill directory for ${skill.path}: ${errorMessage(error)}`
+      ]
+    };
+  }
+
+  for (const file of referenceFiles.slice(0, maxReferences)) {
+    try {
+      const realFile = await fsp.realpath(file);
+
+      if (!isInsideDir(realSkillDir, realFile)) {
+        warnings.push(
+          `Skipped reference outside skill directory: ${displayPath(file, workspaceRoot)}`
+        );
+        continue;
+      }
+
+      const loaded = await readTextWithStats(file, maxReferenceBytes);
+
+      references.push({
+        path: displayPath(file, workspaceRoot),
+        text: loaded.text,
+        bytes: loaded.bytes,
+        totalBytes: loaded.totalBytes,
+        truncated: loaded.truncated
+      });
+    } catch (error) {
+      warnings.push(
+        `Failed to read skill reference ${displayPath(file, workspaceRoot)}: ${errorMessage(error)}`
+      );
+    }
+  }
+
+  return { references, warnings };
+}
+
 function skillSource(skillPath: string, workspaceRoot: string): SkillInventoryItem["source"] {
   if (skillPath.startsWith(`${workspaceRoot}${path.sep}`)) return "workspace";
   if (skillPath.includes(`${path.sep}.codex${path.sep}plugins${path.sep}`)) return "plugin";
@@ -151,11 +283,13 @@ async function discoverSkillRecords(
 ): Promise<SkillInventoryRecord[]> {
   const maxSkills = Math.max(1, Math.min(options.maxSkills ?? 120, 500));
   const roots = [
+    path.join(workspace.root, ".claude", "skills"),
     path.join(workspace.root, ".codex", "skills"),
     path.join(workspace.root, ".agents", "skills"),
     path.join(workspace.root, "skills"),
     ...(options.includeGlobal
       ? [
+          path.join(os.homedir(), ".claude", "skills"),
           path.join(os.homedir(), ".codex", "skills"),
           path.join(os.homedir(), ".agents", "skills"),
           path.join(os.homedir(), ".codex", "plugins", "cache")
@@ -207,6 +341,9 @@ export async function loadSkill(
     includeGlobal?: boolean;
     maxSkills?: number;
     maxBytes?: number;
+    includeReferences?: boolean;
+    maxReferenceBytes?: number;
+    maxReferences?: number;
   }
 ): Promise<LoadedSkill> {
   const name = options.name.trim();
@@ -243,14 +380,22 @@ export async function loadSkill(
   }
   const maxBytes = Math.max(1_000, Math.min(options.maxBytes ?? 40_000, 100_000));
   const loaded = await readTextWithStats(skill.absPath, maxBytes);
+  
+  const referenceResult = await loadSkillReferenceFiles(skill, workspace.root, {
+    includeReferences: options.includeReferences ?? false,
+    maxReferenceBytes: options.maxReferenceBytes,
+    maxReferences: options.maxReferences
+  });
+  
   return {
     skill: publicSkill(skill),
     text: loaded.text,
     bytes: loaded.bytes,
     totalBytes: loaded.totalBytes,
-    truncated: loaded.truncated
+    truncated: loaded.truncated,
+    references: referenceResult.references,
+    warnings: referenceResult.warnings
   };
-}
 
 function parseTomlMcpServers(text: string, source: string): McpServerInventoryItem[] {
   const out: McpServerInventoryItem[] = [];
@@ -307,7 +452,7 @@ export async function codexproInventory(
   mcpServers: McpServerInventoryItem[];
 }> {
   const skills = await discoverSkillInventory(workspace, {
-    includeGlobal: options.includeGlobalSkills !== false,
+    includeGlobal: options.includeGlobalSkills === true,
     maxSkills: options.maxSkills
   });
   const mcpServers = options.includeMcpServers === false ? [] : await discoverMcpServers(workspace);
