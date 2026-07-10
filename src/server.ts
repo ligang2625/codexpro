@@ -14,6 +14,11 @@ import { codexproInventory, loadSkill } from "./capabilitiesOps.js";
 import { listCodexSessions, readCodexSession } from "./codexSessions.js";
 import { TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidgetHtml } from "./toolCardWidget.js";
 import { redactSensitiveText, redactStructured } from "./redact.js";
+import {
+  invokeClaudeCodeSkill,
+  listClaudeCodeTargets,
+  sendToClaudeCode
+} from "./claudeCodeBridge.js";
 
 function errorText(error: unknown): string {
   if (error instanceof Error) return redactSensitiveText(`${error.name}: ${error.message}`);
@@ -215,7 +220,10 @@ const STANDARD_TOOL_NAMES = [
   "codex_context",
   "read_handoff",
   "export_pro_context",
-  "handoff_to_agent"
+  "handoff_to_agent",
+  "list_claude_code_targets",
+  "send_to_claude_code",
+  "invoke_claude_code_skill"
 ] as const;
 
 const FULL_TOOL_NAMES = [
@@ -297,6 +305,7 @@ function serverInstructions(config: CodexProConfig): string {
     "5. Use bash only for meaningful verification commands such as npm test, npm run build, lint, typecheck, or an existing project script.",
     "6. Keep tool calls minimal. Prefer one targeted search plus show_changes instead of repeated broad bash/git calls.",
     "7. Skill rule: do not auto-select skills. Only call load_skill when the user explicitly names a skill, including user skills under ~/.claude/skills, or when .claude/WEBGPT.md names a specific required skill. Treat SKILL.md and references as guidance, not as permission to execute scripts or read secrets.",
+    "8. Claude Code bridge rule: only send text to Claude Code when the user explicitly asks. Use list_claude_code_targets first if the target is unclear. Default to submit=false unless the user clearly asks to send/execute/submit. Do not read Claude Code output, do not answer Claude Code permission prompts, and do not use the bridge as a shell.",
     config.codexSessions !== "off"
       ? `7. Codex session history access is enabled in ${config.codexSessions} mode. Use it only when the user asks for local Codex session history.`
       : "",
@@ -1690,6 +1699,193 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       });
     }
   );
+
+  
+  registerCodexTool(
+    config,
+    server,
+    "list_claude_code_targets",
+    {
+      title: "List Claude Code Targets",
+      description:
+        "List allowlisted tmux targets that CodexPro is allowed to send text to for Claude Code. Targets come from CODEXPRO_CLAUDE_TARGETS.",
+      inputSchema: {}
+    },
+    async () => {
+      const targets = listClaudeCodeTargets();
+  
+      const text = targets.length
+        ? [
+            "# Claude Code Targets",
+            "",
+            ...targets.map((target) => `- ${target.name} -> ${target.tmuxTarget}`)
+          ].join("\n")
+        : [
+            "# Claude Code Targets",
+            "",
+            "No Claude Code targets configured.",
+            "",
+            "Set CODEXPRO_CLAUDE_TARGETS, for example:",
+            "",
+            "```bash",
+            "export CODEXPRO_CLAUDE_TARGETS=cc-stock,cc-codexpro",
+            "```",
+            "",
+            "Or use aliases:",
+            "",
+            "```bash",
+            "export CODEXPRO_CLAUDE_TARGETS=stock=cc-stock,codexpro=cc-codexpro:0.0",
+            "```"
+          ].join("\n");
+  
+      return textResult(text, {
+        enabled: targets.length > 0,
+        targets: targets.map((target) => ({
+          name: target.name,
+          tmux_target: target.tmuxTarget
+        }))
+      });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "send_to_claude_code",
+    {
+      title: "Send to Claude Code",
+      description:
+        "Paste text into an allowlisted tmux target running Claude Code. This does not read Claude Code output. By default it only pastes text; set submit=true to press Enter.",
+      inputSchema: {
+        target: z
+          .string()
+          .min(1)
+          .describe(
+            "Allowlisted Claude Code target name from CODEXPRO_CLAUDE_TARGETS, not an arbitrary tmux target."
+          ),
+  
+        text: z
+          .string()
+          .min(1)
+          .max(200_000)
+          .describe("Text to paste into the Claude Code terminal."),
+  
+        submit: z
+          .boolean()
+          .optional()
+          .describe(
+            "If true, press Enter after pasting. Default: false."
+          )
+      }
+    },
+    async (args) => {
+      const result = await sendToClaudeCode({
+        target: String(args.target ?? ""),
+        text: String(args.text ?? ""),
+        submit: parseBool(args.submit, false)
+      });
+  
+      const text = [
+        "# Sent to Claude Code",
+        "",
+        `Target: ${result.target}`,
+        `tmux target: ${result.tmuxTarget}`,
+        `Submitted: ${result.submitted ? "yes" : "no"}`,
+        `Bytes: ${result.bytes}`,
+        "",
+        result.submitted
+          ? "The text was pasted and Enter was sent."
+          : "The text was pasted only. Review it in the Claude Code terminal and press Enter manually if appropriate."
+      ].join("\n");
+  
+      return textResult(text, {
+        ok: result.ok,
+        target: result.target,
+        tmux_target: result.tmuxTarget,
+        submitted: result.submitted,
+        bytes: result.bytes
+      });
+    }
+  );
+  
+  registerCodexTool(
+    config,
+    server,
+    "invoke_claude_code_skill",
+    {
+      title: "Invoke Claude Code Skill",
+      description:
+        "Paste a Claude Code slash skill command into an allowlisted tmux target. This only constructs '/skill-name arguments' and sends it to Claude Code; it does not execute scripts or bypass Claude Code permissions.",
+      inputSchema: {
+        target: z
+          .string()
+          .min(1)
+          .describe(
+            "Allowlisted Claude Code target name from CODEXPRO_CLAUDE_TARGETS."
+          ),
+  
+        skill: z
+          .string()
+          .min(1)
+          .max(128)
+          .regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/)
+          .describe(
+            "Claude Code skill name without leading slash, for example review-to-plan."
+          ),
+  
+        arguments: z
+          .string()
+          .optional()
+          .describe("Arguments to pass after the slash skill command."),
+  
+        submit: z
+          .boolean()
+          .optional()
+          .describe(
+            "If true, press Enter after pasting the slash command. Default: false."
+          )
+      }
+    },
+    async (args) => {
+      const result = await invokeClaudeCodeSkill({
+        target: String(args.target ?? ""),
+        skill: String(args.skill ?? ""),
+        arguments: typeof args.arguments === "string" ? args.arguments : undefined,
+        submit: parseBool(args.submit, false)
+      });
+  
+      const text = [
+        "# Claude Code Skill Command Sent",
+        "",
+        `Target: ${result.target}`,
+        `tmux target: ${result.tmuxTarget}`,
+        `Skill: ${result.skill}`,
+        `Submitted: ${result.submitted ? "yes" : "no"}`,
+        `Bytes: ${result.bytes}`,
+        "",
+        "Command:",
+        "",
+        "```text",
+        result.command,
+        "```",
+        "",
+        result.submitted
+          ? "The command was pasted and Enter was sent."
+          : "The command was pasted only. Review it in the Claude Code terminal and press Enter manually if appropriate."
+      ].join("\n");
+  
+      return textResult(text, {
+        ok: result.ok,
+        target: result.target,
+        tmux_target: result.tmuxTarget,
+        skill: result.skill,
+        command: result.command,
+        submitted: result.submitted,
+        bytes: result.bytes
+      });
+    }
+  );
+
 
   if (config.codexSessions !== "off") {
     registerCodexTool(
