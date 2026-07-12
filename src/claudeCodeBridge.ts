@@ -18,6 +18,17 @@ export interface ClaudeCodeSkillResult extends ClaudeCodeSendResult {
   command: string;
 }
 
+export interface ClaudeCodeCaptureResult {
+  ok: true;
+  target: string;
+  tmuxTarget: string;
+  lines: number;
+  output: string;
+  bytes: number;
+  totalBytes: number;
+  truncated: boolean;
+}
+
 const TARGET_NAME_RE = /^[A-Za-z0-9_.-]{1,80}$/;
 const TMUX_TARGET_RE = /^[A-Za-z0-9_.:@/%+-]{1,160}$/;
 const SKILL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
@@ -34,6 +45,69 @@ function parsePositiveIntEnv(name: string, fallback: number, min: number, max: n
 
 function maxTextBytes(): number {
   return parsePositiveIntEnv("CODEXPRO_CLAUDE_MAX_TEXT_BYTES", 20_000, 1_000, 200_000);
+}
+
+function maxCaptureLines(): number {
+  return parsePositiveIntEnv("CODEXPRO_CLAUDE_CAPTURE_MAX_LINES", 500, 1, 5_000);
+}
+
+function maxCaptureBytes(): number {
+  return parsePositiveIntEnv("CODEXPRO_CLAUDE_CAPTURE_MAX_BYTES", 120_000, 1_000, 1_000_000);
+}
+
+function normalizeCaptureLines(lines: number | undefined): number {
+  const fallback = 80;
+  const limit = maxCaptureLines();
+
+  if (lines === undefined) {
+    return Math.min(fallback, limit);
+  }
+
+  if (!Number.isFinite(lines)) {
+    return Math.min(fallback, limit);
+  }
+
+  return Math.max(1, Math.min(Math.floor(lines), limit));
+}
+
+function truncateUtf8(
+  text: string,
+  maxBytes: number
+): { text: string; bytes: number; totalBytes: number; truncated: boolean } {
+  const totalBytes = Buffer.byteLength(text, "utf8");
+
+  if (totalBytes <= maxBytes) {
+    return {
+      text,
+      bytes: totalBytes,
+      totalBytes,
+      truncated: false
+    };
+  }
+
+  const marker = "\n...[capture truncated]";
+  const markerBytes = Buffer.byteLength(marker, "utf8");
+  const bodyLimit = Math.max(0, maxBytes - markerBytes);
+
+  let used = 0;
+  let out = "";
+
+  for (const char of text) {
+    const charBytes = Buffer.byteLength(char, "utf8");
+    if (used + charBytes > bodyLimit) break;
+
+    out += char;
+    used += charBytes;
+  }
+
+  const truncatedText = `${out}${marker}`;
+
+  return {
+    text: truncatedText,
+    bytes: Buffer.byteLength(truncatedText, "utf8"),
+    totalBytes,
+    truncated: true
+  };
 }
 
 function assertSafeTargetName(name: string): void {
@@ -219,6 +293,41 @@ export async function sendToClaudeCode(input: {
     bytes
   };
 }
+
+export async function captureClaudeCodeOutput(input: {
+  target: string;
+  lines?: number;
+}): Promise<ClaudeCodeCaptureResult> {
+  const target = findTarget(input.target);
+  const lines = normalizeCaptureLines(input.lines);
+
+  await assertTmuxTargetExists(target);
+
+  const rawOutput = await runTmux([
+    "capture-pane",
+    "-p",
+    "-J",
+    "-S",
+    `-${lines}`,
+    "-t",
+    target.tmuxTarget
+  ]);
+
+  const output = rawOutput.replace(/\r\n/g, "\n").trimEnd();
+  const bounded = truncateUtf8(output, maxCaptureBytes());
+
+  return {
+    ok: true,
+    target: target.name,
+    tmuxTarget: target.tmuxTarget,
+    lines,
+    output: bounded.text,
+    bytes: bounded.bytes,
+    totalBytes: bounded.totalBytes,
+    truncated: bounded.truncated
+  };
+}
+
 
 export function buildClaudeCodeSkillCommand(skill: string, args?: string): string {
   const cleanSkill = skill.trim();
