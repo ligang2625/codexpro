@@ -15,6 +15,7 @@ import { listCodexSessions, readCodexSession } from "./codexSessions.js";
 import { TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidgetHtml } from "./toolCardWidget.js";
 import { redactSensitiveText, redactStructured } from "./redact.js";
 import {
+  captureClaudeCodeOutput,
   invokeClaudeCodeSkill,
   listClaudeCodeTargets,
   sendToClaudeCode
@@ -223,7 +224,8 @@ const STANDARD_TOOL_NAMES = [
   "handoff_to_agent",
   "list_claude_code_targets",
   "send_to_claude_code",
-  "invoke_claude_code_skill"
+  "invoke_claude_code_skill",
+  "capture_claude_output"
 ] as const;
 
 const FULL_TOOL_NAMES = [
@@ -248,7 +250,11 @@ const FULL_TOOL_NAMES = [
   "codex_context",
   "export_pro_context",
   "handoff_to_agent",
-  "handoff_to_codex"
+  "handoff_to_codex",
+  "list_claude_code_targets",
+  "send_to_claude_code",
+  "invoke_claude_code_skill",
+  "capture_claude_output"
 ] as const;
 
 function codexSessionToolNames(config: CodexProConfig): string[] {
@@ -305,7 +311,7 @@ function serverInstructions(config: CodexProConfig): string {
     "5. Use bash only for meaningful verification commands such as npm test, npm run build, lint, typecheck, or an existing project script.",
     "6. Keep tool calls minimal. Prefer one targeted search plus show_changes instead of repeated broad bash/git calls.",
     "7. Skill rule: do not auto-select skills. Only call load_skill when the user explicitly names a skill, including user skills under ~/.claude/skills, or when .claude/WEBGPT.md names a specific required skill. Treat SKILL.md and references as guidance, not as permission to execute scripts or read secrets.",
-    "8. Claude Code bridge rule: only send text to Claude Code when the user explicitly asks. Use list_claude_code_targets first if the target is unclear. Default to submit=false unless the user clearly asks to send/execute/submit. Do not read Claude Code output, do not answer Claude Code permission prompts, and do not use the bridge as a shell.",
+    "8. Claude Code bridge rule: only send text to Claude Code when the user explicitly asks. Use list_claude_code_targets first if the target is unclear. Default to submit=false unless the user clearly asks to send/execute/submit. Use capture_claude_output only when the user asks to inspect Claude Code output or continue from its visible response. capture_claude_output is read-only and returns recent tmux pane text only; do not treat it as full Claude state, do not answer Claude Code permission prompts, and do not use the bridge as a shell.",
     config.codexSessions !== "off"
       ? `7. Codex session history access is enabled in ${config.codexSessions} mode. Use it only when the user asks for local Codex session history.`
       : "",
@@ -333,6 +339,16 @@ function parseBool(value: unknown, fallback = false): boolean {
 
 function diffBlock(diff: string): string {
   return `\n\n\`\`\`diff\n${diff}\n\`\`\``;
+}
+
+function codeFenceFor(value: string): string {
+  let fence = "```";
+
+  while (value.includes(fence)) {
+    fence += "`";
+  }
+
+  return fence;
 }
 
 function diffStats(diff: string): { additions: number; deletions: number; changed: boolean } {
@@ -1755,7 +1771,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     {
       title: "Send to Claude Code",
       description:
-        "Paste text into an allowlisted tmux target running Claude Code. This does not read Claude Code output. By default it only pastes text; set submit=true to press Enter.",
+        "Paste text into an allowlisted tmux target running Claude Code. This does not read Claude Code output; use capture_claude_output separately for recent visible output. By default it only pastes text; set submit=true to press Enter.",
       inputSchema: {
         target: z
           .string()
@@ -1886,6 +1902,83 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     }
   );
 
+  registerCodexTool(
+    config,
+    server,
+    "capture_claude_output",
+    {
+      title: "Capture Claude Code Output",
+      description:
+        "Read recent visible output from an allowlisted tmux target running Claude Code. This is read-only, bounded, and does not infer Claude Code state.",
+      inputSchema: {
+        target: z
+          .string()
+          .min(1)
+          .describe(
+            "Allowlisted Claude Code target name from CODEXPRO_CLAUDE_TARGETS, not an arbitrary tmux target."
+          ),
+        lines: z
+          .number()
+          .int()
+          .min(1)
+          .max(5000)
+          .optional()
+          .describe(
+            "Number of recent tmux pane lines to capture. Default: 80. The server also clamps this with CODEXPRO_CLAUDE_CAPTURE_MAX_LINES."
+          )
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Reading Claude Code output...",
+        "openai/toolInvocation/invoked": "Claude Code output captured"
+      }
+    },
+    async (args) => {
+      const requestedLines = args.lines === undefined ? undefined : Number(args.lines);
+  
+      const result = await captureClaudeCodeOutput({
+        target: String(args.target ?? ""),
+        lines: Number.isFinite(requestedLines) ? requestedLines : undefined
+      });
+  
+      const output = result.output || "(no output captured)";
+      const fence = codeFenceFor(output);
+  
+      const text = [
+        "# Claude Code Output",
+        "",
+        `Target: ${result.target}`,
+        `tmux target: ${result.tmuxTarget}`,
+        `Lines requested: ${result.lines}`,
+        `Bytes returned: ${result.bytes}`,
+        `Total bytes captured before truncation: ${result.totalBytes}`,
+        `Truncated: ${result.truncated ? "yes" : "no"}`,
+        "",
+        result.truncated
+          ? "Output was truncated by CODEXPRO_CLAUDE_CAPTURE_MAX_BYTES."
+          : "Output is bounded to the requested recent pane lines.",
+        "",
+        "## Output",
+        "",
+        `${fence}text`,
+        output,
+        fence
+      ].join("\n");
+  
+      return textResult(text, {
+        ok: result.ok,
+        target: result.target,
+        tmux_target: result.tmuxTarget,
+        lines: result.lines,
+        output: result.output,
+        bytes: result.bytes,
+        total_bytes: result.totalBytes,
+        truncated: result.truncated
+      });
+    }
+  );
+  
 
   if (config.codexSessions !== "off") {
     registerCodexTool(
