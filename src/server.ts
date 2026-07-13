@@ -227,7 +227,8 @@ const STANDARD_TOOL_NAMES = [
   "send_to_claude_code",
   "invoke_claude_code_skill",
   "capture_claude_output",
-  "inspect_claude_code_status"
+  "inspect_claude_code_status",
+  "sync_claude_code_status"
 ] as const;
 
 const FULL_TOOL_NAMES = [
@@ -257,7 +258,8 @@ const FULL_TOOL_NAMES = [
   "send_to_claude_code",
   "invoke_claude_code_skill",
   "capture_claude_output",
-  "inspect_claude_code_status"
+  "inspect_claude_code_status",
+  "sync_claude_code_status"
 ] as const;
 
 function codexSessionToolNames(config: CodexProConfig): string[] {
@@ -314,7 +316,7 @@ function serverInstructions(config: CodexProConfig): string {
     "5. Use bash only for meaningful verification commands such as npm test, npm run build, lint, typecheck, or an existing project script.",
     "6. Keep tool calls minimal. Prefer one targeted search plus show_changes instead of repeated broad bash/git calls.",
     "7. Skill rule: do not auto-select skills. Only call load_skill when the user explicitly names a skill, including user skills under ~/.claude/skills, or when .claude/WEBGPT.md names a specific required skill. Treat SKILL.md and references as guidance, not as permission to execute scripts or read secrets.",
-    "8. Claude Code bridge rule: only send text to Claude Code when the user explicitly asks. Use list_claude_code_targets first if the target is unclear. Default to submit=false unless the user clearly asks to send/execute/submit. Use capture_claude_output when the user asks for raw recent Claude Code output. Use inspect_claude_code_status when the user asks whether Claude Code is done, running, waiting for input, waiting for permission, or when continuing from its visible response. Both tools are read-only and return recent tmux pane text only; inspect_claude_code_status is heuristic and must not be treated as full Claude state. Do not answer Claude Code permission prompts, do not auto-confirm permissions, do not run tmux through bash, and do not use the bridge as a shell.",
+    "8. Claude Code bridge rule: only send text to Claude Code when the user explicitly asks. Use list_claude_code_targets first if the target is unclear. Default to submit=false unless the user clearly asks to send/execute/submit. Use capture_claude_output when the user asks for raw recent Claude Code output. Use inspect_claude_code_status when the user asks whether Claude Code is done, running, waiting for input, waiting for permission, or when continuing from its visible response. Use sync_claude_code_status when the user asks to save, persist, synchronize, or share Claude Code status with the workspace. capture_claude_output and inspect_claude_code_status are read-only; sync_claude_code_status reads recent tmux pane text and writes bounded status snapshots under the workspace. inspect_claude_code_status is heuristic and must not be treated as full Claude state. Do not answer Claude Code permission prompts, do not auto-confirm permissions, do not run tmux through bash, and do not use the bridge as a shell.",
     config.codexSessions !== "off"
       ? `7. Codex session history access is enabled in ${config.codexSessions} mode. Use it only when the user asks for local Codex session history.`
       : "",
@@ -352,6 +354,112 @@ function codeFenceFor(value: string): string {
   }
 
   return fence;
+}
+
+function normalizeWorkspaceWritePath(config: CodexProConfig, value: unknown, fallbackName: string): string {
+  const fallbackPath = `${config.contextDir.replace(/\/$/, "")}/${fallbackName}`;
+  const raw = typeof value === "string" && value.trim() ? value.trim() : fallbackPath;
+
+  if (path.isAbsolute(raw) || raw.startsWith("~") || /^[A-Za-z]:[\\/]/.test(raw)) {
+    throw new CodexProError(`Status sync path must be workspace-relative: ${raw}`);
+  }
+
+  const normalized = raw.split(path.sep).join("/").replace(/^\.\//, "");
+
+  if (
+    normalized === "" ||
+    normalized === "." ||
+    normalized === ".." ||
+    normalized.startsWith("../") ||
+    normalized.includes("/../")
+  ) {
+    throw new CodexProError(`Status sync path escapes workspace root: ${raw}`);
+  }
+
+  return normalized;
+}
+
+function statusSyncStructured(result: Awaited<ReturnType<typeof inspectClaudeCodeStatus>>): Record<string, unknown> {
+  return {
+    target: result.target,
+    tmux_target: result.tmuxTarget,
+    status: result.status,
+    confidence: result.confidence,
+    heuristic: result.heuristic,
+    analyzed_at: result.analyzedAt,
+    lines: result.lines,
+    bytes: result.bytes,
+    total_bytes: result.totalBytes,
+    truncated: result.truncated,
+    signals: result.signals,
+    output: result.output
+  };
+}
+
+function buildClaudeStatusMarkdown(result: Awaited<ReturnType<typeof inspectClaudeCodeStatus>>): string {
+  const output = result.output || "(no output captured)";
+  const fence = codeFenceFor(output);
+
+  const signals = result.signals.length
+    ? result.signals
+        .map((signal) =>
+          [
+            `- ${signal.kind}: ${signal.description}`,
+            signal.evidence ? `  Evidence: ${signal.evidence}` : ""
+          ]
+            .filter(Boolean)
+            .join("\n")
+        )
+        .join("\n")
+    : "- No signals detected.";
+
+  return [
+    "# Claude Code Status",
+    "",
+    `Target: ${result.target}`,
+    `tmux target: ${result.tmuxTarget}`,
+    `Status: ${result.status}`,
+    `Confidence: ${result.confidence}`,
+    `Heuristic: ${result.heuristic ? "yes" : "no"}`,
+    `Analyzed at: ${result.analyzedAt}`,
+    `Lines inspected: ${result.lines}`,
+    `Bytes returned: ${result.bytes}`,
+    `Total bytes captured before truncation: ${result.totalBytes}`,
+    `Truncated: ${result.truncated ? "yes" : "no"}`,
+    "",
+    "This file is a workspace status snapshot generated from recent tmux pane text.",
+    "It is not Claude Code internal state and may be incomplete or stale.",
+    "",
+    "## Signals",
+    "",
+    signals,
+    "",
+    "## Recent Output",
+    "",
+    `${fence}text`,
+    output,
+    fence,
+    ""
+  ].join("\n");
+}
+
+function buildClaudeStatusHistoryLine(result: Awaited<ReturnType<typeof inspectClaudeCodeStatus>>): string {
+  return (
+    JSON.stringify({
+      ts: new Date().toISOString(),
+      target: result.target,
+      tmux_target: result.tmuxTarget,
+      status: result.status,
+      confidence: result.confidence,
+      heuristic: result.heuristic,
+      analyzed_at: result.analyzedAt,
+      lines: result.lines,
+      bytes: result.bytes,
+      total_bytes: result.totalBytes,
+      truncated: result.truncated,
+      signals: result.signals
+    }) + "\n"
+  );
 }
 
 function diffStats(diff: string): { additions: number; deletions: number; changed: boolean } {
@@ -2083,8 +2191,168 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       });
     }
   );
+    
+  registerCodexTool(
+    config,
+    server,
+    "sync_claude_code_status",
+    {
+      title: "Sync Claude Code Status",
+      description:
+        "Inspect recent visible Claude Code output and write workspace status snapshots as Markdown, JSON, and JSONL history. This reads tmux output and writes only inside the workspace.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use default workspace."),
+        target: z
+          .string()
+          .min(1)
+          .describe(
+            "Allowlisted Claude Code target name from CODEXPRO_CLAUDE_TARGETS, not an arbitrary tmux target."
+          ),
+        lines: z
+          .number()
+          .int()
+          .min(1)
+          .max(5000)
+          .optional()
+          .describe(
+            "Number of recent tmux pane lines to inspect. Default: 120. The server also clamps this with CODEXPRO_CLAUDE_CAPTURE_MAX_LINES."
+          ),
+        markdown_path: z
+          .string()
+          .optional()
+          .describe("Workspace-relative Markdown snapshot path. Default: .ai-bridge/claude-status.md."),
+        json_path: z
+          .string()
+          .optional()
+          .describe("Workspace-relative JSON snapshot path. Default: .ai-bridge/claude-status.json."),
+        history_path: z
+          .string()
+          .optional()
+          .describe("Workspace-relative JSONL append-only history path. Default: .ai-bridge/claude-status-history.jsonl."),
+        include_output: z
+          .boolean()
+          .optional()
+          .describe("Include recent Claude Code output in the JSON snapshot. Default: true.")
+      },
+      annotations: HANDOFF_WRITE_ANNOTATIONS,
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Syncing Claude Code status...",
+        "openai/toolInvocation/invoked": "Claude Code status synced"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
   
+      await ensureAiBridge(config, guard, workspace);
+  
+      const markdownPath = normalizeWorkspaceWritePath(config, args.markdown_path, "claude-status.md");
+      const jsonPath = normalizeWorkspaceWritePath(config, args.json_path, "claude-status.json");
+      const historyPath = normalizeWorkspaceWritePath(config, args.history_path, "claude-status-history.jsonl");
+  
+      const markdownResolved = guard.resolve(workspace, markdownPath, { forWrite: true });
+      const jsonResolved = guard.resolve(workspace, jsonPath, { forWrite: true });
+      const historyResolved = guard.resolve(workspace, historyPath, { forWrite: true });
+  
+      assertWriteToolAllowed(config, markdownResolved.relPath);
+      assertWriteToolAllowed(config, jsonResolved.relPath);
+      assertWriteToolAllowed(config, historyResolved.relPath);
+  
+      const requestedLines = args.lines === undefined ? 120 : Number(args.lines);
+  
+      const result = await inspectClaudeCodeStatus({
+        target: String(args.target ?? ""),
+        lines: Number.isFinite(requestedLines) ? requestedLines : 120
+      });
+  
+      const includeOutput = parseBool(args.include_output, true);
+  
+      const markdown = buildClaudeStatusMarkdown(result);
+      const structured = statusSyncStructured(result);
+  
+      if (!includeOutput) {
+        delete structured.output;
+      }
+  
+      const json = `${JSON.stringify(structured, null, 2)}\n`;
+      const historyLine = buildClaudeStatusHistoryLine(result);
+  
+      const markdownWrite = await writeTextFile(config, guard, workspace, markdownResolved.relPath, markdown, {
+        createDirs: true,
+        overwrite: true
+      });
+  
+      const jsonWrite = await writeTextFile(config, guard, workspace, jsonResolved.relPath, json, {
+        createDirs: true,
+        overwrite: true
+      });
+  
+      await fsp.mkdir(path.dirname(historyResolved.absPath), { recursive: true });
+      await fsp.appendFile(historyResolved.absPath, historyLine, "utf8");
+  
+      const text = [
+        "# Claude Code Status Synced",
+        "",
+        `Workspace: ${workspace.root}`,
+        `Target: ${result.target}`,
+        `tmux target: ${result.tmuxTarget}`,
+        `Status: ${result.status}`,
+        `Confidence: ${result.confidence}`,
+        `Heuristic: ${result.heuristic ? "yes" : "no"}`,
+        `Analyzed at: ${result.analyzedAt}`,
+        "",
+        "## Files",
+        "",
+        `- Markdown snapshot: ${markdownWrite.path}`,
+        `- JSON snapshot: ${jsonWrite.path}`,
+        `- JSONL history: ${historyResolved.relPath}`,
+        "",
+        "## Signals",
+        "",
+        result.signals.length
+          ? result.signals
+              .map((signal) =>
+                [
+                  `- ${signal.kind}: ${signal.description}`,
+                  signal.evidence ? `  Evidence: ${signal.evidence}` : ""
+                ]
+                  .filter(Boolean)
+                  .join("\n")
+              )
+              .join("\n")
+          : "- No signals detected.",
+        "",
+        "The synced status is based only on recent tmux pane text. It is not Claude Code internal state."
+      ].join("\n");
+  
+      return textResult(text, {
+        workspace_id: workspace.id,
+        root: workspace.root,
+        ok: result.ok,
+        target: result.target,
+        tmux_target: result.tmuxTarget,
+        status: result.status,
+        confidence: result.confidence,
+        heuristic: result.heuristic,
+        analyzed_at: result.analyzedAt,
+        signals: result.signals,
+        lines: result.lines,
+        bytes: result.bytes,
+        total_bytes: result.totalBytes,
+        truncated: result.truncated,
+        include_output: includeOutput,
+        markdown_path: markdownWrite.path,
+        markdown_bytes: markdownWrite.bytes,
+        markdown_sha256: markdownWrite.sha256,
+        json_path: jsonWrite.path,
+        json_bytes: jsonWrite.bytes,
+        json_sha256: jsonWrite.sha256,
+        history_path: historyResolved.relPath
+      });
+    }
+  );
 
+  
   if (config.codexSessions !== "off") {
     registerCodexTool(
       config,
