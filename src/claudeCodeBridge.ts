@@ -29,6 +29,30 @@ export interface ClaudeCodeCaptureResult {
   truncated: boolean;
 }
 
+export type ClaudeCodeStatus =
+  | "empty"
+  | "waiting_permission"
+  | "waiting_input"
+  | "likely_running"
+  | "likely_done"
+  | "unknown";
+
+export type ClaudeCodeStatusConfidence = "low" | "medium" | "high";
+
+export interface ClaudeCodeStatusSignal {
+  kind: string;
+  description: string;
+  evidence: string;
+}
+
+export interface ClaudeCodeInspectResult extends ClaudeCodeCaptureResult {
+  status: ClaudeCodeStatus;
+  confidence: ClaudeCodeStatusConfidence;
+  signals: ClaudeCodeStatusSignal[];
+  heuristic: true;
+  analyzedAt: string;
+}
+
 const TARGET_NAME_RE = /^[A-Za-z0-9_.-]{1,80}$/;
 const TMUX_TARGET_RE = /^[A-Za-z0-9_.:@/%+-]{1,160}$/;
 const SKILL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
@@ -107,6 +131,210 @@ function truncateUtf8(
     bytes: Buffer.byteLength(truncatedText, "utf8"),
     totalBytes,
     truncated: true
+  };
+}
+
+function signalEvidence(value: string): string {
+  return value.replace(/\s+/g, " ").trim().slice(0, 240);
+}
+
+function recentNonEmptyLines(output: string, maxLines = 80): string[] {
+  return output
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0)
+    .slice(-maxLines);
+}
+
+function findMatchingLine(lines: string[], patterns: RegExp[]): string | undefined {
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i] ?? "";
+
+    if (patterns.some((pattern) => pattern.test(line))) {
+      return line;
+    }
+  }
+
+  return undefined;
+}
+
+function analyzeClaudeCodeOutput(output: string): {
+  status: ClaudeCodeStatus;
+  confidence: ClaudeCodeStatusConfidence;
+  signals: ClaudeCodeStatusSignal[];
+} {
+  const trimmed = output.trim();
+  const signals: ClaudeCodeStatusSignal[] = [];
+
+  if (!trimmed) {
+    return {
+      status: "empty",
+      confidence: "high",
+      signals: [
+        {
+          kind: "empty_output",
+          description: "No visible Claude Code output was captured from the tmux pane.",
+          evidence: ""
+        }
+      ]
+    };
+  }
+
+  const lines = recentNonEmptyLines(trimmed, 100);
+  const recentLines = lines.slice(-30);
+  const tail = recentLines.join("\n");
+
+  const permissionEvidence = findMatchingLine(recentLines, [
+    /\bdo you want to proceed\b/i,
+    /\bdo you want to continue\b/i,
+    /\ballow\b.*\?/i,
+    /\bapprove\b.*\?/i,
+    /\bpermission\b.*\?/i,
+    /\bpermission required\b/i,
+    /\bneeds permission\b/i,
+    /\bcan i\b.*\?/i,
+    /\bwould you like to\b.*\?/i,
+    /\byes\b.*\bno\b/i,
+    /\by\/n\b/i,
+    /\bY\/n\b/,
+    /\bN\/y\b/,
+    /❯.*\b(yes|allow|approve|proceed)\b/i
+  ]);
+
+  if (permissionEvidence) {
+    signals.push({
+      kind: "permission_prompt",
+      description:
+        "Recent output looks like Claude Code is asking the user to approve or allow an action.",
+      evidence: signalEvidence(permissionEvidence)
+    });
+
+    return {
+      status: "waiting_permission",
+      confidence: "high",
+      signals
+    };
+  }
+
+  const inputEvidence = findMatchingLine(recentLines, [
+    /\bpress enter\b/i,
+    /\bwaiting for input\b/i,
+    /\benter your\b/i,
+    /\btype your\b/i,
+    /\bplease respond\b/i,
+    /\bcontinue\?\b/i,
+    /^\s*(?:>|❯|\?)\s*$/,
+    /^\s*(?:Human|User):\s*$/i
+  ]);
+
+  if (inputEvidence) {
+    signals.push({
+      kind: "input_prompt",
+      description: "Recent output looks like Claude Code is waiting for user input.",
+      evidence: signalEvidence(inputEvidence)
+    });
+
+    return {
+      status: "waiting_input",
+      confidence: "medium",
+      signals
+    };
+  }
+
+  const runningEvidence = findMatchingLine(recentLines, [
+    /\besc to interrupt\b/i,
+    /\bctrl\+c\b/i,
+    /\bctrl-c\b/i,
+    /\bthinking\b/i,
+    /\brunning\b/i,
+    /\bexecuting\b/i,
+    /\bsearching\b/i,
+    /\breading\b/i,
+    /\bwriting\b/i,
+    /\banalyzing\b/i,
+    /\binstalling\b/i,
+    /\bbuilding\b/i,
+    /\bcompiling\b/i,
+    /…\s*$/
+  ]);
+
+  if (runningEvidence) {
+    signals.push({
+      kind: "activity_marker",
+      description: "Recent output contains activity markers that may indicate Claude Code is still working.",
+      evidence: signalEvidence(runningEvidence)
+    });
+
+    return {
+      status: "likely_running",
+      confidence: "medium",
+      signals
+    };
+  }
+
+  const doneEvidence = findMatchingLine(recentLines, [
+    /\bdone\b/i,
+    /\bcomplete\b/i,
+    /\bcompleted\b/i,
+    /\bfinished\b/i,
+    /\ball set\b/i,
+    /\bready for review\b/i,
+    /\btests? passed\b/i,
+    /\bbuild succeeded\b/i,
+    /\bno issues found\b/i,
+    /\bsuccessfully\b/i
+  ]);
+
+  if (doneEvidence) {
+    signals.push({
+      kind: "completion_marker",
+      description:
+        "Recent output contains completion-like language. This is only a heuristic and may be wrong.",
+      evidence: signalEvidence(doneEvidence)
+    });
+
+    return {
+      status: "likely_done",
+      confidence: "medium",
+      signals
+    };
+  }
+
+  const errorLikeEvidence = findMatchingLine(recentLines, [
+    /\berror\b/i,
+    /\bfailed\b/i,
+    /\bfatal\b/i,
+    /\bexception\b/i,
+    /\btraceback\b/i
+  ]);
+
+  if (errorLikeEvidence) {
+    signals.push({
+      kind: "error_like_output",
+      description:
+        "Recent output contains error-like language. Claude Code may have stopped or may need follow-up.",
+      evidence: signalEvidence(errorLikeEvidence)
+    });
+
+    return {
+      status: "likely_done",
+      confidence: "low",
+      signals
+    };
+  }
+
+  signals.push({
+    kind: "recent_output",
+    description:
+      "Output was captured, but no strong running, completion, permission, or input signal was detected.",
+    evidence: signalEvidence(tail.slice(-500))
+  });
+
+  return {
+    status: "unknown",
+    confidence: "low",
+    signals
   };
 }
 
@@ -328,6 +556,22 @@ export async function captureClaudeCodeOutput(input: {
   };
 }
 
+export async function inspectClaudeCodeStatus(input: {
+  target: string;
+  lines?: number;
+}): Promise<ClaudeCodeInspectResult> {
+  const captured = await captureClaudeCodeOutput(input);
+  const analysis = analyzeClaudeCodeOutput(captured.output);
+
+  return {
+    ...captured,
+    status: analysis.status,
+    confidence: analysis.confidence,
+    signals: analysis.signals,
+    heuristic: true,
+    analyzedAt: new Date().toISOString()
+  };
+}
 
 export function buildClaudeCodeSkillCommand(skill: string, args?: string): string {
   const cleanSkill = skill.trim();
