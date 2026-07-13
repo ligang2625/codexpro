@@ -16,6 +16,7 @@ import { TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidgetHtml } from "./toolCa
 import { redactSensitiveText, redactStructured } from "./redact.js";
 import {
   captureClaudeCodeOutput,
+  inspectClaudeCodeStatus,
   invokeClaudeCodeSkill,
   listClaudeCodeTargets,
   sendToClaudeCode
@@ -225,7 +226,8 @@ const STANDARD_TOOL_NAMES = [
   "list_claude_code_targets",
   "send_to_claude_code",
   "invoke_claude_code_skill",
-  "capture_claude_output"
+  "capture_claude_output",
+  "inspect_claude_code_status"
 ] as const;
 
 const FULL_TOOL_NAMES = [
@@ -254,7 +256,8 @@ const FULL_TOOL_NAMES = [
   "list_claude_code_targets",
   "send_to_claude_code",
   "invoke_claude_code_skill",
-  "capture_claude_output"
+  "capture_claude_output",
+  "inspect_claude_code_status"
 ] as const;
 
 function codexSessionToolNames(config: CodexProConfig): string[] {
@@ -311,7 +314,7 @@ function serverInstructions(config: CodexProConfig): string {
     "5. Use bash only for meaningful verification commands such as npm test, npm run build, lint, typecheck, or an existing project script.",
     "6. Keep tool calls minimal. Prefer one targeted search plus show_changes instead of repeated broad bash/git calls.",
     "7. Skill rule: do not auto-select skills. Only call load_skill when the user explicitly names a skill, including user skills under ~/.claude/skills, or when .claude/WEBGPT.md names a specific required skill. Treat SKILL.md and references as guidance, not as permission to execute scripts or read secrets.",
-    "8. Claude Code bridge rule: only send text to Claude Code when the user explicitly asks. Use list_claude_code_targets first if the target is unclear. Default to submit=false unless the user clearly asks to send/execute/submit. Use capture_claude_output only when the user asks to inspect Claude Code output or continue from its visible response. capture_claude_output is read-only and returns recent tmux pane text only; do not treat it as full Claude state, do not answer Claude Code permission prompts, and do not use the bridge as a shell.",
+    "8. Claude Code bridge rule: only send text to Claude Code when the user explicitly asks. Use list_claude_code_targets first if the target is unclear. Default to submit=false unless the user clearly asks to send/execute/submit. Use capture_claude_output when the user asks for raw recent Claude Code output. Use inspect_claude_code_status when the user asks whether Claude Code is done, running, waiting for input, waiting for permission, or when continuing from its visible response. Both tools are read-only and return recent tmux pane text only; inspect_claude_code_status is heuristic and must not be treated as full Claude state. Do not answer Claude Code permission prompts, do not auto-confirm permissions, do not run tmux through bash, and do not use the bridge as a shell.",
     config.codexSessions !== "off"
       ? `7. Codex session history access is enabled in ${config.codexSessions} mode. Use it only when the user asks for local Codex session history.`
       : "",
@@ -1970,6 +1973,108 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         ok: result.ok,
         target: result.target,
         tmux_target: result.tmuxTarget,
+        lines: result.lines,
+        output: result.output,
+        bytes: result.bytes,
+        total_bytes: result.totalBytes,
+        truncated: result.truncated
+      });
+    }
+  );
+
+
+  registerCodexTool(
+    config,
+    server,
+    "inspect_claude_code_status",
+    {
+      title: "Inspect Claude Code Status",
+      description:
+        "Read recent visible output from an allowlisted tmux target running Claude Code and return a heuristic status summary. This is read-only and must not be treated as full Claude state.",
+      inputSchema: {
+        target: z
+          .string()
+          .min(1)
+          .describe(
+            "Allowlisted Claude Code target name from CODEXPRO_CLAUDE_TARGETS, not an arbitrary tmux target."
+          ),
+        lines: z
+          .number()
+          .int()
+          .min(1)
+          .max(5000)
+          .optional()
+          .describe(
+            "Number of recent tmux pane lines to inspect. Default: 80. The server also clamps this with CODEXPRO_CLAUDE_CAPTURE_MAX_LINES."
+          )
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Inspecting Claude Code status...",
+        "openai/toolInvocation/invoked": "Claude Code status inspected"
+      }
+    },
+    async (args) => {
+      const requestedLines = args.lines === undefined ? undefined : Number(args.lines);
+  
+      const result = await inspectClaudeCodeStatus({
+        target: String(args.target ?? ""),
+        lines: Number.isFinite(requestedLines) ? requestedLines : undefined
+      });
+  
+      const output = result.output || "(no output captured)";
+      const fence = codeFenceFor(output);
+  
+      const signals = result.signals.length
+        ? result.signals
+            .map((signal) =>
+              [
+                `- ${signal.kind}: ${signal.description}`,
+                signal.evidence ? `  Evidence: ${signal.evidence}` : ""
+              ]
+                .filter(Boolean)
+                .join("\n")
+            )
+            .join("\n")
+        : "- No signals detected.";
+  
+      const text = [
+        "# Claude Code Status",
+        "",
+        `Target: ${result.target}`,
+        `tmux target: ${result.tmuxTarget}`,
+        `Status: ${result.status}`,
+        `Confidence: ${result.confidence}`,
+        `Heuristic: ${result.heuristic ? "yes" : "no"}`,
+        `Analyzed at: ${result.analyzedAt}`,
+        `Lines inspected: ${result.lines}`,
+        `Bytes returned: ${result.bytes}`,
+        `Total bytes captured before truncation: ${result.totalBytes}`,
+        `Truncated: ${result.truncated ? "yes" : "no"}`,
+        "",
+        "This status is a heuristic based only on recent tmux pane text. It is not Claude Code internal state.",
+        "",
+        "## Signals",
+        "",
+        signals,
+        "",
+        "## Recent Output",
+        "",
+        `${fence}text`,
+        output,
+        fence
+      ].join("\n");
+  
+      return textResult(text, {
+        ok: result.ok,
+        target: result.target,
+        tmux_target: result.tmuxTarget,
+        status: result.status,
+        confidence: result.confidence,
+        heuristic: result.heuristic,
+        analyzed_at: result.analyzedAt,
+        signals: result.signals,
         lines: result.lines,
         output: result.output,
         bytes: result.bytes,
