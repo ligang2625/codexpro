@@ -21,6 +21,7 @@ import {
   listClaudeCodeTargets,
   sendToClaudeCode
 } from "./claudeCodeBridge.js";
+import { createReviewExecutionTask } from "./reviewExecutionTask.js";
 
 function errorText(error: unknown): string {
   if (error instanceof Error) return redactSensitiveText(`${error.name}: ${error.message}`);
@@ -223,12 +224,12 @@ const STANDARD_TOOL_NAMES = [
   "read_handoff",
   "export_pro_context",
   "handoff_to_agent",
+  "create_review_execution_task",
   "list_claude_code_targets",
   "send_to_claude_code",
   "invoke_claude_code_skill",
   "capture_claude_output",
-  "inspect_claude_code_status",
-  "sync_claude_code_status"
+  "inspect_claude_code_status"
 ] as const;
 
 const FULL_TOOL_NAMES = [
@@ -253,6 +254,7 @@ const FULL_TOOL_NAMES = [
   "codex_context",
   "export_pro_context",
   "handoff_to_agent",
+  "create_review_execution_task",
   "handoff_to_codex",
   "list_claude_code_targets",
   "send_to_claude_code",
@@ -317,6 +319,7 @@ function serverInstructions(config: CodexProConfig): string {
     "6. Keep tool calls minimal. Prefer one targeted search plus show_changes instead of repeated broad bash/git calls.",
     "7. Skill rule: do not auto-select skills. Only call load_skill when the user explicitly names a skill, including user skills under ~/.claude/skills, or when .claude/WEBGPT.md names a specific required skill. Treat SKILL.md and references as guidance, not as permission to execute scripts or read secrets.",
     "8. Claude Code bridge rule: only send text to Claude Code when the user explicitly asks. Use list_claude_code_targets first if the target is unclear. Default to submit=false unless the user clearly asks to send/execute/submit. Use capture_claude_output when the user asks for raw recent Claude Code output. Use inspect_claude_code_status when the user asks whether Claude Code is done, running, waiting for input, waiting for permission, or when continuing from its visible response. Use sync_claude_code_status when the user asks to save, persist, synchronize, or share Claude Code status with the workspace. capture_claude_output and inspect_claude_code_status are read-only; sync_claude_code_status reads recent tmux pane text and writes bounded status snapshots under the workspace. inspect_claude_code_status is heuristic and must not be treated as full Claude state. Do not answer Claude Code permission prompts, do not auto-confirm permissions, do not run tmux through bash, and do not use the bridge as a shell.",
+    "9. Review handoff rule: when WebGPT has reviewed code and the user wants local Claude Code to implement changes, prefer create_review_execution_task first. It writes a structured .ai-bridge review task and returns a prompt for Claude Code, but it does not send, submit, execute, wait, or confirm permissions.",
     config.codexSessions !== "off"
       ? `7. Codex session history access is enabled in ${config.codexSessions} mode. Use it only when the user asks for local Codex session history.`
       : "",
@@ -2352,6 +2355,139 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     }
   );
 
+  registerCodexTool(
+    config,
+    server,
+    "create_review_execution_task",
+    {
+      title: "Create Review Execution Task",
+      description:
+        "Convert WebGPT code review findings into .ai-bridge handoff artifacts for Claude Code. This only writes task files and returns a prompt; it does not send text, submit Enter, execute code, wait, loop, or confirm permissions.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use default workspace."),
+        target: z
+          .string()
+          .optional()
+          .describe("Optional allowlisted Claude Code target name from CODEXPRO_CLAUDE_TARGETS."),
+        title: z.string().min(1).max(160).describe("Short title for this review-to-execution task."),
+        review_goal: z
+          .string()
+          .min(1)
+          .max(8000)
+          .describe("What WebGPT reviewed and what this modification round should accomplish."),
+        reviewed_files: z
+          .array(z.string().min(1).max(300))
+          .max(200)
+          .optional()
+          .describe("Files WebGPT reviewed before producing the findings."),
+        findings: z
+          .array(
+            z.object({
+              file: z.string().max(300).optional().describe("Relevant file path, if known."),
+              issue: z.string().min(1).max(4000).describe("Problem found during WebGPT review."),
+              recommendation: z.string().min(1).max(4000).describe("Concrete change WebGPT recommends."),
+              priority: z.enum(["low", "medium", "high"]).optional().describe("Finding priority. Default: medium."),
+              risk: z.string().max(2000).optional().describe("Risk or caution for Claude Code.")
+            })
+          )
+          .min(1)
+          .max(80)
+          .describe("Structured WebGPT review findings that Claude Code should implement."),
+        allowed_files: z
+          .array(z.string().min(1).max(300))
+          .max(200)
+          .optional()
+          .describe("Optional file paths Claude Code is allowed to modify."),
+        forbidden_actions: z
+          .array(z.string().min(1).max(500))
+          .max(200)
+          .optional()
+          .describe("Actions Claude Code must not perform."),
+        test_instructions: z
+          .array(z.string().min(1).max(500))
+          .max(80)
+          .optional()
+          .describe("Verification commands or checks Claude Code should run when practical."),
+        extra_context: z
+          .string()
+          .max(10000)
+          .optional()
+          .describe("Optional extra context to include in the handoff prompt.")
+      },
+      annotations: HANDOFF_WRITE_ANNOTATIONS,
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Creating review execution task...",
+        "openai/toolInvocation/invoked": "Review execution task created"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+  
+      const result = await createReviewExecutionTask(config, guard, workspace, {
+        target: typeof args.target === "string" ? args.target : undefined,
+        title: String(args.title ?? ""),
+        reviewGoal: String(args.review_goal ?? ""),
+        reviewedFiles: Array.isArray(args.reviewed_files) ? args.reviewed_files : undefined,
+        findings: Array.isArray(args.findings) ? args.findings : [],
+        allowedFiles: Array.isArray(args.allowed_files) ? args.allowed_files : undefined,
+        forbiddenActions: Array.isArray(args.forbidden_actions) ? args.forbidden_actions : undefined,
+        testInstructions: Array.isArray(args.test_instructions) ? args.test_instructions : undefined,
+        extraContext: typeof args.extra_context === "string" ? args.extra_context : undefined
+      });
+  
+      const fence = codeFenceFor(result.promptForClaude);
+  
+      const text = [
+        "# Review Execution Task",
+        "",
+        `Task ID: ${result.taskId}`,
+        `Title: ${result.title}`,
+        `Target: ${result.target ?? "(not selected)"}`,
+        `Status: ${result.status}`,
+        "",
+        "## Files Written",
+        "",
+        `- ${result.files.reviewPlanMarkdown}`,
+        `- ${result.files.executionTaskMarkdown}`,
+        `- ${result.files.executionTaskJson}`,
+        `- ${result.files.historyJsonl}`,
+        "",
+        "## Safety",
+        "",
+        "- User confirmation required: yes",
+        "- Default submit: false",
+        "- Auto-send: no",
+        "- Auto-submit: no",
+        "- Auto permission confirmation: no",
+        "- Auto loop: no",
+        "",
+        "## Prompt For Claude Code",
+        "",
+        `${fence}text`,
+        result.promptForClaude,
+        fence,
+        "",
+        "Next step: review the prompt. If it is correct, call send_to_claude_code with submit=false, or paste it manually into the Claude Code terminal."
+      ].join("\n");
+  
+      return textResult(text, {
+        workspace_id: workspace.id,
+        root: workspace.root,
+        task_id: result.taskId,
+        target: result.target,
+        title: result.title,
+        status: result.status,
+        files: result.files,
+        prompt_for_claude: result.promptForClaude,
+        review_plan_markdown: result.reviewPlanMarkdown,
+        execution_task_markdown: result.executionTaskMarkdown,
+        json_payload: result.jsonPayload,
+        writes: result.writes,
+        safety: result.safety
+      });
+    }
+  );
   
   if (config.codexSessions !== "off") {
     registerCodexTool(
