@@ -2362,7 +2362,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     {
       title: "Create Review Execution Task",
       description:
-        "Convert WebGPT code review findings into .ai-bridge handoff artifacts for Claude Code. This only writes task files and returns a prompt; it does not send text, submit Enter, execute code, wait, loop, or confirm permissions.",
+        "Convert WebGPT code review findings into .ai-bridge handoff artifacts for Claude Code. Supports inline prompts, file-reference prompts, and direct Claude Code slash-command prompts. This only writes task files and returns a prompt; it does not send text, submit Enter, execute code, wait, loop, or confirm permissions.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use default workspace."),
         target: z
@@ -2412,7 +2412,27 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
           .string()
           .max(10000)
           .optional()
-          .describe("Optional extra context to include in the handoff prompt.")
+          .describe("Optional extra context to include in the handoff prompt."),
+        prompt_mode: z
+          .enum(["inline", "file_reference", "skill_file_reference"])
+          .optional()
+          .describe(
+            "How to build prompt_for_claude. Default: file_reference. inline returns the full task. file_reference tells Claude Code to read the task file. skill_file_reference returns a direct slash command such as /implement-task .ai-bridge/claude-execution-task.md."
+          ),
+        claude_skill: z
+          .string()
+          .min(1)
+          .max(120)
+          .optional()
+          .describe(
+            "Claude Code slash skill name used when prompt_mode=skill_file_reference. Accepts implement-task or /implement-task."
+          ),
+        task_file_for_claude: z
+          .enum(["execution_task", "review_plan"])
+          .optional()
+          .describe(
+            "Which handoff file the returned prompt should ask Claude Code to read. Default: execution_task."
+          )
       },
       annotations: HANDOFF_WRITE_ANNOTATIONS,
       _meta: {
@@ -2433,7 +2453,19 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         allowedFiles: Array.isArray(args.allowed_files) ? args.allowed_files : undefined,
         forbiddenActions: Array.isArray(args.forbidden_actions) ? args.forbidden_actions : undefined,
         testInstructions: Array.isArray(args.test_instructions) ? args.test_instructions : undefined,
-        extraContext: typeof args.extra_context === "string" ? args.extra_context : undefined
+        extraContext: typeof args.extra_context === "string" ? args.extra_context : undefined,
+        promptMode:
+          args.prompt_mode === "inline" ||
+          args.prompt_mode === "file_reference" ||
+          args.prompt_mode === "skill_file_reference"
+            ? args.prompt_mode
+            : undefined,
+        claudeSkill: typeof args.claude_skill === "string" ? args.claude_skill : undefined,
+        taskFileForClaude:
+          args.task_file_for_claude === "review_plan" ||
+          args.task_file_for_claude === "execution_task"
+            ? args.task_file_for_claude
+            : undefined
       });
   
       const fence = codeFenceFor(result.promptForClaude);
@@ -2445,6 +2477,9 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         `Title: ${result.title}`,
         `Target: ${result.target ?? "(not selected)"}`,
         `Status: ${result.status}`,
+        `Prompt mode: ${result.promptMode}`,
+        `Claude skill: ${result.claudeSkill ? `/${result.claudeSkill}` : "(none)"}`,
+        `Task file for Claude: ${result.taskFilePath}`,
         "",
         "## Files Written",
         "",
@@ -2468,7 +2503,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         result.promptForClaude,
         fence,
         "",
-        "Next step: review the prompt. If it is correct, call send_to_claude_code with submit=false, or paste it manually into the Claude Code terminal."
+        "Next step: review the returned prompt. If it is correct, call send_to_claude_code with submit=false, or paste it manually into the Claude Code terminal. In file_reference mode, Claude Code will be asked to read the task file itself. In skill_file_reference mode, the prompt starts with a direct slash command."
       ].join("\n");
   
       return textResult(text, {
@@ -2478,8 +2513,15 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         target: result.target,
         title: result.title,
         status: result.status,
+      
+        prompt_mode: result.promptMode,
+        claude_skill: result.claudeSkill,
+        task_file_for_claude: result.taskFileForClaude,
+        task_file_path: result.taskFilePath,
+      
         files: result.files,
         prompt_for_claude: result.promptForClaude,
+        execution_instructions: result.executionInstructions,
         review_plan_markdown: result.reviewPlanMarkdown,
         execution_task_markdown: result.executionTaskMarkdown,
         json_payload: result.jsonPayload,
