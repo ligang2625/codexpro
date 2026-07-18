@@ -128,7 +128,7 @@ export interface DispatchReviewExecutionTaskResult {
   };
 }
 
-interface StoredReviewExecutionTask {
+export interface StoredReviewExecutionTask {
   jsonPath: string;
   payload: Record<string, unknown>;
 
@@ -145,6 +145,16 @@ interface StoredReviewExecutionTask {
 
   taskFilePath: string;
   recommendedSkill: string | null;
+
+  reviewGoal: string;
+  reviewedFiles: string[];
+  findings: ReviewExecutionFindingInput[];
+  allowedFiles: string[];
+  forbiddenActions: string[];
+  testInstructions: string[];
+
+  resultMarkdownPath: string;
+  resultJsonPath: string;
 
   historyPath: string;
 }
@@ -198,6 +208,10 @@ export interface ReviewExecutionTaskFiles {
   reviewPlanMarkdown: string;
   executionTaskMarkdown: string;
   executionTaskJson: string;
+
+  executionResultMarkdown: string;
+  executionResultJson: string;
+
   historyJsonl: string;
 }
 
@@ -242,6 +256,19 @@ export interface CreateReviewExecutionTaskResult {
       deletions: number;
     };
     executionTaskJson: {
+      path: string;
+      bytes: number;
+      additions: number;
+      deletions: number;
+    };
+    executionResultMarkdown: {
+      path: string;
+      bytes: number;
+      additions: number;
+      deletions: number;
+    };
+    
+    executionResultJson: {
       path: string;
       bytes: number;
       additions: number;
@@ -680,17 +707,21 @@ function buildExecutionTaskMarkdown(input: {
   executionInstructions: string;
   reviewPlanPath: string;
   jsonPath: string;
+  resultMarkdownPath: string;
+  resultJsonPath: string;
   createdAt: string;
 }): string {
   return [
-    `# Claude Code Execution Task`,
+    "# Claude Code Execution Task",
     "",
     `Task ID: ${input.taskId}`,
     `Created: ${input.createdAt}`,
     `Target: ${input.target ?? "(not selected)"}`,
-    `Status: draft`,
+    "Status: draft",
     `Review plan: ${input.reviewPlanPath}`,
-    `JSON: ${input.jsonPath}`,
+    `Task JSON: ${input.jsonPath}`,
+    `Execution result Markdown: ${input.resultMarkdownPath}`,
+    `Execution result JSON: ${input.resultJsonPath}`,
     "",
     "## Send Policy",
     "",
@@ -705,6 +736,61 @@ function buildExecutionTaskMarkdown(input: {
     input.executionInstructions,
     ""
   ].join("\n");
+}
+
+function buildInitialExecutionResultMarkdown(input: {
+  taskId: string;
+  title: string;
+  createdAt: string;
+}): string {
+  return [
+    "# Claude Code Execution Result",
+    "",
+    `Task ID: ${input.taskId}`,
+    `Task: ${input.title}`,
+    "Status: pending",
+    `Updated: ${input.createdAt}`,
+    "",
+    "This file was initialized by CodexPro.",
+    "",
+    "A Claude Code local result-reporting Skill should replace this",
+    "placeholder after the task is completed, blocked, failed,",
+    "partially completed, or waiting for user input.",
+    ""
+  ].join("\n");
+}
+
+function buildInitialExecutionResultPayload(input: {
+  taskId: string;
+  title: string;
+  taskFilePath: string;
+  createdAt: string;
+}): Record<string, unknown> {
+  return {
+    schema_version: 1,
+    kind: "claude_execution_result",
+
+    task_id: input.taskId,
+    task_title: input.title,
+    task_file: input.taskFilePath,
+
+    status: "pending",
+    summary: "",
+
+    changed_files: [],
+    change_summary: [],
+    tests: [],
+    remaining_issues: [],
+    risks: [],
+
+    needs_input: null,
+
+    started_at: null,
+    completed_at: null,
+    updated_at: input.createdAt,
+
+    initialized_by: "codexpro"
+  };
 }
 
 function buildJsonPayload(input: {
@@ -731,7 +817,7 @@ function buildJsonPayload(input: {
   createdAt: string;
 }): Record<string, unknown> {
   return {
-    schema_version: 2,
+    schema_version: 3,
     kind: "webgpt_review_execution_task",
     task_id: input.taskId,
     created_at: input.createdAt,
@@ -780,9 +866,21 @@ function buildJsonPayload(input: {
       review_plan_markdown: input.files.reviewPlanMarkdown,
       execution_task_markdown: input.files.executionTaskMarkdown,
       execution_task_json: input.files.executionTaskJson,
+    
+      execution_result_markdown: input.files.executionResultMarkdown,
+      execution_result_json: input.files.executionResultJson,
+    
       history_jsonl: input.files.historyJsonl
     },
 
+    result_contract: {
+      schema_version: 1,
+      producer: "claude_code_local_skill",
+      consumer_tool: "inspect_review_execution_result",
+      result_markdown: input.files.executionResultMarkdown,
+      result_json: input.files.executionResultJson
+    },
+    
     lifecycle: {
       status: "draft",
       created_at: input.createdAt,
@@ -969,20 +1067,98 @@ async function assertTaskFileExists(
   );
 }
 
-async function readStoredReviewExecutionTask(
+function storedStringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+
+  return [
+    ...new Set(
+      value
+        .map((item) => String(item ?? "").trim())
+        .filter(Boolean)
+    )
+  ];
+}
+
+function storedFindings(
+  value: unknown
+): ReviewExecutionFindingInput[] {
+  if (!Array.isArray(value)) return [];
+
+  const out: ReviewExecutionFindingInput[] = [];
+
+  for (const item of value) {
+    if (
+      !item ||
+      typeof item !== "object" ||
+      Array.isArray(item)
+    ) {
+      continue;
+    }
+
+    const record = item as Record<string, unknown>;
+
+    const issue = String(
+      record.issue ?? ""
+    ).trim();
+
+    const recommendation = String(
+      record.recommendation ?? ""
+    ).trim();
+
+    if (!issue || !recommendation) {
+      continue;
+    }
+
+    out.push({
+      file:
+        typeof record.file === "string" &&
+        record.file.trim()
+          ? record.file.trim()
+          : undefined,
+
+      issue,
+      recommendation,
+
+      priority:
+        record.priority === "low" ||
+        record.priority === "medium" ||
+        record.priority === "high"
+          ? record.priority
+          : "medium",
+
+      risk:
+        typeof record.risk === "string" &&
+        record.risk.trim()
+          ? record.risk.trim()
+          : undefined
+    });
+  }
+
+  return out;
+}
+
+export async function readStoredReviewExecutionTask(
   config: CodexProConfig,
   guard: PathGuard,
   workspace: Workspace
 ): Promise<StoredReviewExecutionTask> {
-  const jsonPath = `${config.contextDir}/claude-execution-task.json`;
-  const resolved = guard.resolve(workspace, jsonPath);
+  const jsonPath =
+    `${config.contextDir}/claude-execution-task.json`;
+
+  const resolved = guard.resolve(
+    workspace,
+    jsonPath
+  );
 
   await guard.assertTextFile(
     resolved.absPath,
     Math.min(config.maxReadBytes, 1_000_000)
   );
 
-  const raw = await fsp.readFile(resolved.absPath, "utf8");
+  const raw = await fsp.readFile(
+    resolved.absPath,
+    "utf8"
+  );
 
   let parsed: unknown;
 
@@ -996,18 +1172,26 @@ async function readStoredReviewExecutionTask(
 
   const payload = objectValue(parsed);
 
-  if (payload.kind !== "webgpt_review_execution_task") {
+  if (
+    payload.kind !==
+    "webgpt_review_execution_task"
+  ) {
     throw new CodexProError(
       `Invalid review execution task kind in ${jsonPath}.`
     );
   }
 
-  const schemaVersion = Number(payload.schema_version ?? 1);
+  const schemaVersion = Number(
+    payload.schema_version ?? 1
+  );
 
+  /*
+   * 第三轮将任务 schema 升级到 3。
+   */
   if (
     !Number.isInteger(schemaVersion) ||
     schemaVersion < 1 ||
-    schemaVersion > 2
+    schemaVersion > 3
   ) {
     throw new CodexProError(
       `Unsupported review execution task schema_version: ${String(
@@ -1023,47 +1207,148 @@ async function readStoredReviewExecutionTask(
   );
 
   const title =
-    optionalStoredString(payload.title, 500) ??
+    optionalStoredString(
+      payload.title,
+      500
+    ) ??
     "Review Execution Task";
 
-  const lifecycle = objectValue(payload.lifecycle);
-  const status = normalizeStoredLifecycleStatus(
-    lifecycle.status ?? payload.status
+  const lifecycle = objectValue(
+    payload.lifecycle
   );
 
-  const target = optionalStoredString(payload.target, 80);
-  const promptMode = normalizeStoredPromptMode(payload.prompt_mode);
+  const status =
+    normalizeStoredLifecycleStatus(
+      lifecycle.status ?? payload.status
+    );
+
+  const target = optionalStoredString(
+    payload.target,
+    80
+  );
+
+  const promptMode =
+    normalizeStoredPromptMode(
+      payload.prompt_mode
+    );
 
   const promptForClaude =
-    optionalStoredString(payload.prompt_for_claude, 200_000) ?? "";
+    optionalStoredString(
+      payload.prompt_for_claude,
+      200_000
+    ) ?? "";
 
   const executionInstructions =
-    optionalStoredString(payload.execution_instructions, 200_000) ?? "";
+    optionalStoredString(
+      payload.execution_instructions,
+      200_000
+    ) ?? "";
 
-  const files = objectValue(payload.files);
-  const handoff = objectValue(payload.handoff);
-
-  const taskFilePath = normalizeAiBridgeRelativePath(
-    config,
-    payload.task_file_path ??
-      handoff.task_file ??
-      files.execution_task_markdown,
-    "task_file_path"
+  const files = objectValue(
+    payload.files
   );
 
-  const recommendedSkill = normalizeClaudeSkill(
-    payload.recommended_skill ??
-      handoff.recommended_skill ??
-      payload.claude_skill
+  const handoff = objectValue(
+    payload.handoff
   );
 
-  const historyPath = normalizeAiBridgeRelativePath(
-    config,
-    files.history_jsonl ??
-      `${config.contextDir}/review-task-history.jsonl`,
-    "files.history_jsonl"
-  );
+  /*
+   * Claude Code 实际读取的任务文件。
+   */
+  const taskFilePath =
+    normalizeAiBridgeRelativePath(
+      config,
+      payload.task_file_path ??
+        handoff.task_file ??
+        files.execution_task_markdown,
+      "task_file_path"
+    );
 
+  /*
+   * 创建任务时记录的推荐 Skill。
+   *
+   * 注意：
+   * dispatch 时不会自动使用它。
+   * 实际 Skill 仍由 dispatch 请求指定。
+   */
+  const recommendedSkill =
+    normalizeClaudeSkill(
+      payload.recommended_skill ??
+        handoff.recommended_skill ??
+        payload.claude_skill
+    );
+
+  /*
+   * 第三轮新增：Claude Code 结构化结果文件路径。
+   */
+  const resultMarkdownPath =
+    normalizeAiBridgeRelativePath(
+      config,
+      files.execution_result_markdown ??
+        `${config.contextDir}/claude-execution-result.md`,
+      "files.execution_result_markdown"
+    );
+
+  const resultJsonPath =
+    normalizeAiBridgeRelativePath(
+      config,
+      files.execution_result_json ??
+        `${config.contextDir}/claude-execution-result.json`,
+      "files.execution_result_json"
+    );
+
+  const historyPath =
+    normalizeAiBridgeRelativePath(
+      config,
+      files.history_jsonl ??
+        `${config.contextDir}/review-task-history.jsonl`,
+      "files.history_jsonl"
+    );
+
+  /*
+   * 第三轮新增：恢复原始 WebGPT 审查上下文。
+   *
+   * inspect_review_execution_result 会把这些内容返回给
+   * 网页端 GPT，供它复核实际代码。
+   */
+  const reviewGoal =
+    optionalStoredString(
+      payload.review_goal,
+      20_000
+    ) ?? "";
+
+  const reviewedFiles =
+    storedStringList(
+      payload.reviewed_files
+    );
+
+  const findings =
+    storedFindings(
+      payload.findings
+    );
+
+  const allowedFiles =
+    storedStringList(
+      payload.allowed_files
+    );
+
+  const forbiddenActions =
+    storedStringList(
+      payload.forbidden_actions
+    );
+
+  const testInstructions =
+    storedStringList(
+      payload.test_instructions
+    );
+
+  /*
+   * 任务文件必须存在，否则无法正常 dispatch。
+   *
+   * 结果文件不在这里强制要求存在：
+   * inspect_review_execution_result 会区分
+   * missing / invalid / pending 等状态。
+   */
   await assertTaskFileExists(
     config,
     guard,
@@ -1074,16 +1359,31 @@ async function readStoredReviewExecutionTask(
   return {
     jsonPath,
     payload,
+
     schemaVersion,
     taskId,
     title,
     status,
+
     target,
     promptMode,
+
     promptForClaude,
     executionInstructions,
+
     taskFilePath,
     recommendedSkill,
+
+    reviewGoal,
+    reviewedFiles,
+    findings,
+    allowedFiles,
+    forbiddenActions,
+    testInstructions,
+
+    resultMarkdownPath,
+    resultJsonPath,
+
     historyPath
   };
 }
@@ -1240,6 +1540,10 @@ export async function createReviewExecutionTask(
     reviewPlanMarkdown: `${config.contextDir}/webgpt-review-plan.md`,
     executionTaskMarkdown: `${config.contextDir}/claude-execution-task.md`,
     executionTaskJson: `${config.contextDir}/claude-execution-task.json`,
+  
+    executionResultMarkdown: `${config.contextDir}/claude-execution-result.md`,
+    executionResultJson: `${config.contextDir}/claude-execution-result.json`,
+  
     historyJsonl: `${config.contextDir}/review-task-history.jsonl`
   };
 
@@ -1284,11 +1588,31 @@ export async function createReviewExecutionTask(
     target,
     title,
     executionInstructions,
+  
     reviewPlanPath: files.reviewPlanMarkdown,
     jsonPath: files.executionTaskJson,
+  
+    resultMarkdownPath: files.executionResultMarkdown,
+    resultJsonPath: files.executionResultJson,
+  
     createdAt
   });
 
+  const initialExecutionResultMarkdown =
+    buildInitialExecutionResultMarkdown({
+      taskId,
+      title,
+      createdAt
+    });
+  
+  const initialExecutionResultPayload =
+    buildInitialExecutionResultPayload({
+      taskId,
+      title,
+      taskFilePath: files.executionTaskMarkdown,
+      createdAt
+    });
+  
   const jsonPayload = buildJsonPayload({
     taskId,
     target,
@@ -1349,6 +1673,30 @@ export async function createReviewExecutionTask(
     }
   );
 
+  const resultMarkdownWrite = await writeTextFile(
+    config,
+    guard,
+    workspace,
+    files.executionResultMarkdown,
+    initialExecutionResultMarkdown,
+    {
+      createDirs: true,
+      overwrite: true
+    }
+  );
+  
+  const resultJsonWrite = await writeTextFile(
+    config,
+    guard,
+    workspace,
+    files.executionResultJson,
+    `${JSON.stringify(initialExecutionResultPayload, null, 2)}\n`,
+    {
+      createDirs: true,
+      overwrite: true
+    }
+  );
+  
   await appendHistory(
     guard,
     workspace,
@@ -1364,10 +1712,25 @@ export async function createReviewExecutionTask(
       task_file_path: taskFilePath,
       review_plan_markdown: files.reviewPlanMarkdown,
       execution_task_markdown: files.executionTaskMarkdown,
-      execution_task_json: files.executionTaskJson
+      execution_task_json: files.executionTaskJson,
+      execution_result_markdown: files.executionResultMarkdown,
+      execution_result_json: files.executionResultJson
     }
   );
 
+  await appendHistory(
+    guard,
+    workspace,
+    files.historyJsonl,
+    "execution_result_initialized",
+    {
+      task_id: taskId,
+      status: "pending",
+      execution_result_markdown: files.executionResultMarkdown,
+      execution_result_json: files.executionResultJson
+    }
+  );
+  
   return {
     taskId,
     target,
@@ -1404,6 +1767,19 @@ export async function createReviewExecutionTask(
         bytes: jsonWrite.bytes,
         additions: jsonWrite.diff.additions,
         deletions: jsonWrite.diff.deletions
+      },
+      executionResultMarkdown: {
+        path: resultMarkdownWrite.path,
+        bytes: resultMarkdownWrite.bytes,
+        additions: resultMarkdownWrite.diff.additions,
+        deletions: resultMarkdownWrite.diff.deletions
+      },
+      
+      executionResultJson: {
+        path: resultJsonWrite.path,
+        bytes: resultJsonWrite.bytes,
+        additions: resultJsonWrite.diff.additions,
+        deletions: resultJsonWrite.diff.deletions
       }
     },
 
