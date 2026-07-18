@@ -5,7 +5,14 @@ import { randomUUID } from "node:crypto";
 import type { CodexProConfig } from "./config.js";
 import { CodexProError, PathGuard, type Workspace } from "./guard.js";
 import { ensureAiBridge, writeTextFile } from "./fsOps.js";
-import { listClaudeCodeTargets } from "./claudeCodeBridge.js";
+import {
+  buildClaudeCodeSkillCommand,
+  invokeClaudeCodeSkill,
+  listClaudeCodeTargets,
+  sendToClaudeCode,
+  type ClaudeCodeSendResult,
+  type ClaudeCodeSkillResult
+} from "./claudeCodeBridge.js";
 
 export type ReviewFindingPriority = "low" | "medium" | "high";
 
@@ -17,6 +24,130 @@ export type ReviewExecutionPromptMode =
 export type ReviewExecutionTaskFileForClaude =
   | "execution_task"
   | "review_plan";
+
+export type ReviewExecutionDispatchMode = "text" | "skill";
+
+export type ReviewExecutionTaskLifecycleStatus =
+  | "draft"
+  | "pasted"
+  | "submitted"
+  | "dispatch_failed";
+
+export interface DispatchReviewExecutionTaskInput {
+  /**
+   * Must exactly match task_id in claude-execution-task.json.
+   */
+  taskId: string;
+
+  /**
+   * Optional target override for this dispatch.
+   * If omitted, the target stored in the task JSON is used.
+   */
+  target?: string;
+
+  /**
+   * text:
+   *   Send the stored text/file-reference prompt.
+   *
+   * skill:
+   *   Invoke the Skill selected in this dispatch and pass the task file
+   *   path as the Skill arguments.
+   *
+   * Default: text.
+   */
+  dispatchMode?: ReviewExecutionDispatchMode;
+
+  /**
+   * Required only when dispatchMode=skill.
+   * This is the actual Skill used for this dispatch.
+   *
+   * It is not taken from the task JSON.
+   */
+  skill?: string;
+
+  /**
+   * false:
+   *   Preview only. No tmux input.
+   *
+   * true:
+   *   Perform the dispatch.
+   *
+   * Default: false.
+   */
+  confirmed?: boolean;
+
+  /**
+   * false:
+   *   Paste the content but do not press Enter.
+   *
+   * true:
+   *   Paste the content and press Enter.
+   *
+   * Default: false.
+   */
+  submit?: boolean;
+}
+
+export interface DispatchReviewExecutionTaskResult {
+  dispatchId: string;
+  taskId: string;
+  title: string;
+  target: string;
+
+  dispatchMode: ReviewExecutionDispatchMode;
+  skill: string | null;
+  recommendedSkill: string | null;
+
+  taskFilePath: string;
+  prompt: string;
+
+  confirmed: boolean;
+  submit: boolean;
+  sent: boolean;
+
+  statusBefore: ReviewExecutionTaskLifecycleStatus;
+  statusAfter: ReviewExecutionTaskLifecycleStatus;
+
+  bridgeResult: ClaudeCodeSendResult | ClaudeCodeSkillResult | null;
+
+  auditUpdated: boolean;
+  auditError?: string;
+
+  taskWrite?: {
+    path: string;
+    bytes: number;
+    additions: number;
+    deletions: number;
+  };
+
+  safety: {
+    requiredExplicitConfirmation: true;
+    submitDefault: false;
+    permissionAutoConfirmAllowed: false;
+    automaticLoopAllowed: false;
+  };
+}
+
+interface StoredReviewExecutionTask {
+  jsonPath: string;
+  payload: Record<string, unknown>;
+
+  schemaVersion: number;
+  taskId: string;
+  title: string;
+  status: ReviewExecutionTaskLifecycleStatus;
+
+  target: string | null;
+  promptMode: ReviewExecutionPromptMode;
+
+  promptForClaude: string;
+  executionInstructions: string;
+
+  taskFilePath: string;
+  recommendedSkill: string | null;
+
+  historyPath: string;
+}
 
 export interface ReviewExecutionFindingInput {
   file?: string;
@@ -248,9 +379,10 @@ function normalizeClaudeSkill(value: unknown): string | null {
 
   const skill = raw.startsWith("/") ? raw.slice(1).trim() : raw;
 
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$/.test(skill)) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(skill)) {
     throw new CodexProError(
-      "claudeSkill must be a Claude Code slash skill name using letters, numbers, dots, underscores, or hyphens. Example: implement-task or /implement-task."
+      "Claude Code skill must use only letters, numbers, underscores, and hyphens. " +
+        "It may optionally include a leading slash. Example: implement-task or /implement-task."
     );
   }
 
@@ -618,9 +750,20 @@ function buildJsonPayload(input: {
     extra_context: input.extraContext ?? null,
 
     prompt_mode: input.promptMode,
+    
+    // Backward-compatible field from Review Handoff v2.
+    // It is only a recommendation and is never automatically used by dispatch.
     claude_skill: input.claudeSkill,
+    
+    recommended_skill: input.claudeSkill,
+    
     task_file_for_claude: input.taskFileForClaude,
     task_file_path: input.taskFilePath,
+    
+    handoff: {
+      task_file: input.taskFilePath,
+      recommended_skill: input.claudeSkill
+    },
 
     /**
      * This is what WebGPT should send to Claude Code after user confirmation.
@@ -640,6 +783,13 @@ function buildJsonPayload(input: {
       history_jsonl: input.files.historyJsonl
     },
 
+    lifecycle: {
+      status: "draft",
+      created_at: input.createdAt,
+      updated_at: input.createdAt,
+      last_dispatch: null
+    },
+    
     safety: {
       requires_user_confirmation: true,
       submit_default: false,
@@ -655,16 +805,399 @@ async function appendHistory(
   guard: PathGuard,
   workspace: Workspace,
   historyPath: string,
-  event: Record<string, unknown>
+  eventName: string,
+  data: Record<string, unknown>
 ): Promise<void> {
   const resolved = guard.resolve(workspace, historyPath, { forWrite: true });
-  await fsp.mkdir(path.dirname(resolved.absPath), { recursive: true });
+
+  await fsp.mkdir(path.dirname(resolved.absPath), {
+    recursive: true
+  });
+
   await fsp.appendFile(
     resolved.absPath,
-    `${JSON.stringify({ ts: new Date().toISOString(), event: "create_review_execution_task", ...event })}\n`,
+    `${JSON.stringify({
+      ts: new Date().toISOString(),
+      event: eventName,
+      ...data
+    })}\n`,
     "utf8"
   );
 }
+
+function objectValue(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+
+  return value as Record<string, unknown>;
+}
+
+function requiredStoredString(
+  value: unknown,
+  fieldName: string,
+  maxLength = 100_000
+): string {
+  const text = String(value ?? "").trim();
+
+  if (!text) {
+    throw new CodexProError(
+      `Invalid review execution task: ${fieldName} is missing or empty.`
+    );
+  }
+
+  if (text.includes("\0")) {
+    throw new CodexProError(
+      `Invalid review execution task: ${fieldName} contains a NUL byte.`
+    );
+  }
+
+  if (Buffer.byteLength(text, "utf8") > maxLength) {
+    throw new CodexProError(
+      `Invalid review execution task: ${fieldName} is too large.`
+    );
+  }
+
+  return text;
+}
+
+function optionalStoredString(
+  value: unknown,
+  maxLength = 100_000
+): string | null {
+  if (value === undefined || value === null) return null;
+
+  const text = String(value).trim();
+  if (!text) return null;
+
+  if (text.includes("\0")) {
+    throw new CodexProError(
+      "Invalid review execution task: stored text contains a NUL byte."
+    );
+  }
+
+  if (Buffer.byteLength(text, "utf8") > maxLength) {
+    throw new CodexProError(
+      "Invalid review execution task: stored text is too large."
+    );
+  }
+
+  return text;
+}
+
+function normalizeStoredLifecycleStatus(
+  value: unknown
+): ReviewExecutionTaskLifecycleStatus {
+  if (value === "pasted") return "pasted";
+  if (value === "submitted") return "submitted";
+  if (value === "dispatch_failed") return "dispatch_failed";
+
+  return "draft";
+}
+
+function normalizeStoredPromptMode(
+  value: unknown
+): ReviewExecutionPromptMode {
+  if (value === "inline") return "inline";
+  if (value === "skill_file_reference") return "skill_file_reference";
+
+  return "file_reference";
+}
+
+function normalizeDispatchMode(
+  value: unknown
+): ReviewExecutionDispatchMode {
+  return value === "skill" ? "skill" : "text";
+}
+
+function normalizeAiBridgeRelativePath(
+  config: CodexProConfig,
+  value: unknown,
+  fieldName: string
+): string {
+  const raw = requiredStoredString(value, fieldName, 2_000)
+    .replace(/\\/g, "/")
+    .replace(/^\.\/+/, "")
+    .replace(/\/+/g, "/");
+
+  if (
+    raw === ".." ||
+    raw.startsWith("../") ||
+    raw.includes("/../") ||
+    raw.startsWith("/")
+  ) {
+    throw new CodexProError(
+      `Invalid review execution task: ${fieldName} must be a relative path inside ${config.contextDir}/.`
+    );
+  }
+
+  const contextDir = config.contextDir
+    .replace(/\\/g, "/")
+    .replace(/^\.\/+/, "")
+    .replace(/\/+$/, "");
+
+  if (raw !== contextDir && !raw.startsWith(`${contextDir}/`)) {
+    throw new CodexProError(
+      `Invalid review execution task: ${fieldName} must be inside ${contextDir}/.`
+    );
+  }
+
+  return raw;
+}
+
+function errorMessage(error: unknown): string {
+  const text = error instanceof Error ? error.message : String(error);
+
+  return text
+    .replace(/\0/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 2_000);
+}
+
+async function assertTaskFileExists(
+  config: CodexProConfig,
+  guard: PathGuard,
+  workspace: Workspace,
+  taskFilePath: string
+): Promise<void> {
+  const resolved = guard.resolve(workspace, taskFilePath);
+
+  await guard.assertTextFile(
+    resolved.absPath,
+    Math.min(config.maxReadBytes, 1_000_000)
+  );
+}
+
+async function readStoredReviewExecutionTask(
+  config: CodexProConfig,
+  guard: PathGuard,
+  workspace: Workspace
+): Promise<StoredReviewExecutionTask> {
+  const jsonPath = `${config.contextDir}/claude-execution-task.json`;
+  const resolved = guard.resolve(workspace, jsonPath);
+
+  await guard.assertTextFile(
+    resolved.absPath,
+    Math.min(config.maxReadBytes, 1_000_000)
+  );
+
+  const raw = await fsp.readFile(resolved.absPath, "utf8");
+
+  let parsed: unknown;
+
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new CodexProError(
+      `Invalid JSON in ${jsonPath}: ${errorMessage(error)}`
+    );
+  }
+
+  const payload = objectValue(parsed);
+
+  if (payload.kind !== "webgpt_review_execution_task") {
+    throw new CodexProError(
+      `Invalid review execution task kind in ${jsonPath}.`
+    );
+  }
+
+  const schemaVersion = Number(payload.schema_version ?? 1);
+
+  if (
+    !Number.isInteger(schemaVersion) ||
+    schemaVersion < 1 ||
+    schemaVersion > 2
+  ) {
+    throw new CodexProError(
+      `Unsupported review execution task schema_version: ${String(
+        payload.schema_version
+      )}`
+    );
+  }
+
+  const taskId = requiredStoredString(
+    payload.task_id,
+    "task_id",
+    200
+  );
+
+  const title =
+    optionalStoredString(payload.title, 500) ??
+    "Review Execution Task";
+
+  const lifecycle = objectValue(payload.lifecycle);
+  const status = normalizeStoredLifecycleStatus(
+    lifecycle.status ?? payload.status
+  );
+
+  const target = optionalStoredString(payload.target, 80);
+  const promptMode = normalizeStoredPromptMode(payload.prompt_mode);
+
+  const promptForClaude =
+    optionalStoredString(payload.prompt_for_claude, 200_000) ?? "";
+
+  const executionInstructions =
+    optionalStoredString(payload.execution_instructions, 200_000) ?? "";
+
+  const files = objectValue(payload.files);
+  const handoff = objectValue(payload.handoff);
+
+  const taskFilePath = normalizeAiBridgeRelativePath(
+    config,
+    payload.task_file_path ??
+      handoff.task_file ??
+      files.execution_task_markdown,
+    "task_file_path"
+  );
+
+  const recommendedSkill = normalizeClaudeSkill(
+    payload.recommended_skill ??
+      handoff.recommended_skill ??
+      payload.claude_skill
+  );
+
+  const historyPath = normalizeAiBridgeRelativePath(
+    config,
+    files.history_jsonl ??
+      `${config.contextDir}/review-task-history.jsonl`,
+    "files.history_jsonl"
+  );
+
+  await assertTaskFileExists(
+    config,
+    guard,
+    workspace,
+    taskFilePath
+  );
+
+  return {
+    jsonPath,
+    payload,
+    schemaVersion,
+    taskId,
+    title,
+    status,
+    target,
+    promptMode,
+    promptForClaude,
+    executionInstructions,
+    taskFilePath,
+    recommendedSkill,
+    historyPath
+  };
+}
+
+function resolveDispatchTarget(
+  requestedTarget: string | undefined,
+  storedTarget: string | null
+): string {
+  const candidate =
+    cleanOptionalOneLine(requestedTarget, "target", 80) ??
+    storedTarget;
+
+  if (!candidate) {
+    const available =
+      listClaudeCodeTargets()
+        .map((item) => item.name)
+        .join(", ") || "none";
+
+    throw new CodexProError(
+      `No Claude Code target was selected. ` +
+        `Pass target explicitly or create the task with a target. ` +
+        `Allowed targets: ${available}`
+    );
+  }
+
+  const target = validateTarget(candidate);
+
+  if (!target) {
+    throw new CodexProError(
+      "Unable to resolve Claude Code target."
+    );
+  }
+
+  return target;
+}
+
+function textPromptForStoredTask(
+  task: StoredReviewExecutionTask
+): string {
+  /*
+   * A task created in skill_file_reference mode may contain a suggested
+   * slash command in prompt_for_claude. A text dispatch must not
+   * accidentally use that suggested Skill.
+   */
+  if (
+    task.promptMode !== "skill_file_reference" &&
+    task.promptForClaude
+  ) {
+    return task.promptForClaude;
+  }
+
+  if (task.promptMode === "inline" && task.executionInstructions) {
+    return task.executionInstructions;
+  }
+
+  return buildFileReferencePrompt(task.taskFilePath);
+}
+
+function updatedPayloadWithDispatch(
+  task: StoredReviewExecutionTask,
+  status: ReviewExecutionTaskLifecycleStatus,
+  lastDispatch: Record<string, unknown>
+): Record<string, unknown> {
+  const now = new Date().toISOString();
+  const oldLifecycle = objectValue(task.payload.lifecycle);
+
+  return {
+    ...task.payload,
+
+    status,
+
+    lifecycle: {
+      ...oldLifecycle,
+      status,
+      updated_at: now,
+      last_dispatch: lastDispatch
+    },
+
+    last_dispatch: lastDispatch
+  };
+}
+
+async function writeStoredReviewExecutionTask(
+  config: CodexProConfig,
+  guard: PathGuard,
+  workspace: Workspace,
+  task: StoredReviewExecutionTask,
+  payload: Record<string, unknown>
+): Promise<{
+  path: string;
+  bytes: number;
+  additions: number;
+  deletions: number;
+}> {
+  const result = await writeTextFile(
+    config,
+    guard,
+    workspace,
+    task.jsonPath,
+    `${JSON.stringify(payload, null, 2)}\n`,
+    {
+      createDirs: true,
+      overwrite: true
+    }
+  );
+
+  return {
+    path: result.path,
+    bytes: result.bytes,
+    additions: result.diff.additions,
+    deletions: result.diff.deletions
+  };
+}
+
 
 export async function createReviewExecutionTask(
   config: CodexProConfig,
@@ -816,18 +1349,24 @@ export async function createReviewExecutionTask(
     }
   );
 
-  await appendHistory(guard, workspace, files.historyJsonl, {
-    task_id: taskId,
-    target,
-    title,
-    prompt_mode: promptMode,
-    claude_skill: claudeSkill,
-    task_file_for_claude: taskFileForClaude,
-    task_file_path: taskFilePath,
-    review_plan_markdown: files.reviewPlanMarkdown,
-    execution_task_markdown: files.executionTaskMarkdown,
-    execution_task_json: files.executionTaskJson
-  });
+  await appendHistory(
+    guard,
+    workspace,
+    files.historyJsonl,
+    "create_review_execution_task",
+    {
+      task_id: taskId,
+      target,
+      title,
+      prompt_mode: promptMode,
+      recommended_skill: claudeSkill,
+      task_file_for_claude: taskFileForClaude,
+      task_file_path: taskFilePath,
+      review_plan_markdown: files.reviewPlanMarkdown,
+      execution_task_markdown: files.executionTaskMarkdown,
+      execution_task_json: files.executionTaskJson
+    }
+  );
 
   return {
     taskId,
@@ -877,4 +1416,358 @@ export async function createReviewExecutionTask(
       autoLoopAllowed: false
     }
   };
+}
+
+export async function dispatchReviewExecutionTask(
+  config: CodexProConfig,
+  guard: PathGuard,
+  workspace: Workspace,
+  rawInput: DispatchReviewExecutionTaskInput
+): Promise<DispatchReviewExecutionTaskResult> {
+  if (config.writeMode === "off") {
+    throw new CodexProError(
+      "dispatch_review_execution_task requires write mode handoff or workspace " +
+        "because every dispatch must update the task audit files."
+    );
+  }
+
+  await ensureAiBridge(config, guard, workspace);
+
+  const task = await readStoredReviewExecutionTask(
+    config,
+    guard,
+    workspace
+  );
+
+  const requestedTaskId = cleanOneLine(
+    rawInput.taskId,
+    "taskId",
+    200
+  );
+
+  if (requestedTaskId !== task.taskId) {
+    throw new CodexProError(
+      `taskId does not match the current review execution task. ` +
+        `Expected ${task.taskId}, received ${requestedTaskId}.`
+    );
+  }
+
+  const target = resolveDispatchTarget(
+    rawInput.target,
+    task.target
+  );
+
+  const dispatchMode = normalizeDispatchMode(
+    rawInput.dispatchMode
+  );
+
+  const confirmed = rawInput.confirmed === true;
+  const submit = rawInput.submit === true;
+
+  let skill: string | null = null;
+  let prompt: string;
+
+  if (dispatchMode === "skill") {
+    skill = normalizeClaudeSkill(rawInput.skill);
+
+    if (!skill) {
+      throw new CodexProError(
+        "skill is required when dispatchMode is skill."
+      );
+    }
+
+    /*
+     * This validates the Skill and creates exactly the same command
+     * that invokeClaudeCodeSkill will send.
+     */
+    prompt = buildClaudeCodeSkillCommand(
+      skill,
+      task.taskFilePath
+    );
+  } else {
+    prompt = textPromptForStoredTask(task);
+  }
+
+  if (!prompt.trim()) {
+    throw new CodexProError(
+      "The selected review execution task does not contain a dispatchable prompt."
+    );
+  }
+
+  const dispatchId =
+    `dispatch_${new Date()
+      .toISOString()
+      .replace(/[-:.TZ]/g, "")
+      .slice(0, 14)}_${randomUUID().slice(0, 8)}`;
+
+  /*
+   * Preview mode:
+   * - no sendToClaudeCode
+   * - no invokeClaudeCodeSkill
+   * - no tmux interaction
+   * - only an audit history entry is appended
+   */
+  if (!confirmed) {
+    await appendHistory(
+      guard,
+      workspace,
+      task.historyPath,
+      "dispatch_preview",
+      {
+        dispatch_id: dispatchId,
+        task_id: task.taskId,
+        target,
+        dispatch_mode: dispatchMode,
+        skill,
+        recommended_skill: task.recommendedSkill,
+        task_file_path: task.taskFilePath,
+        submit,
+        sent: false,
+        status: task.status
+      }
+    );
+
+    return {
+      dispatchId,
+      taskId: task.taskId,
+      title: task.title,
+      target,
+
+      dispatchMode,
+      skill,
+      recommendedSkill: task.recommendedSkill,
+
+      taskFilePath: task.taskFilePath,
+      prompt,
+
+      confirmed: false,
+      submit,
+      sent: false,
+
+      statusBefore: task.status,
+      statusAfter: task.status,
+
+      bridgeResult: null,
+
+      auditUpdated: true,
+
+      safety: {
+        requiredExplicitConfirmation: true,
+        submitDefault: false,
+        permissionAutoConfirmAllowed: false,
+        automaticLoopAllowed: false
+      }
+    };
+  }
+
+  /*
+   * Prevent accidental duplicate dispatch.
+   *
+   * A task that was pasted or submitted may only be sent again by
+   * creating a new review execution task.
+   */
+  if (
+    task.status === "pasted" ||
+    task.status === "submitted"
+  ) {
+    throw new CodexProError(
+      `Task ${task.taskId} has already been dispatched with status ${task.status}. ` +
+        "Create a new review execution task before sending another instruction."
+    );
+  }
+
+  const dispatchedAt = new Date().toISOString();
+
+  try {
+    const bridgeResult:
+      | ClaudeCodeSendResult
+      | ClaudeCodeSkillResult =
+      dispatchMode === "skill"
+        ? await invokeClaudeCodeSkill({
+            target,
+            skill: skill!,
+            arguments: task.taskFilePath,
+            submit
+          })
+        : await sendToClaudeCode({
+            target,
+            text: prompt,
+            submit
+          });
+
+    const statusAfter: ReviewExecutionTaskLifecycleStatus =
+      submit ? "submitted" : "pasted";
+
+    const successEvent = submit
+      ? "dispatch_submitted"
+      : "dispatch_pasted";
+
+    const lastDispatch: Record<string, unknown> = {
+      dispatch_id: dispatchId,
+      dispatched_at: dispatchedAt,
+      result: "success",
+
+      target,
+      tmux_target: bridgeResult.tmuxTarget,
+
+      dispatch_mode: dispatchMode,
+      skill,
+
+      /*
+       * Only informational. It was not used automatically.
+       */
+      recommended_skill: task.recommendedSkill,
+
+      task_file_path: task.taskFilePath,
+
+      submit,
+      submitted: bridgeResult.submitted,
+      bytes: bridgeResult.bytes,
+
+      status_before: task.status,
+      status_after: statusAfter
+    };
+
+    let auditUpdated = true;
+    let auditError: string | undefined;
+    let taskWrite:
+      | {
+          path: string;
+          bytes: number;
+          additions: number;
+          deletions: number;
+        }
+      | undefined;
+
+    /*
+     * Sending has already succeeded at this point.
+     * Audit failure must not pretend that nothing was sent.
+     */
+    try {
+      const updatedPayload = updatedPayloadWithDispatch(
+        task,
+        statusAfter,
+        lastDispatch
+      );
+
+      taskWrite = await writeStoredReviewExecutionTask(
+        config,
+        guard,
+        workspace,
+        task,
+        updatedPayload
+      );
+
+      await appendHistory(
+        guard,
+        workspace,
+        task.historyPath,
+        successEvent,
+        {
+          ...lastDispatch,
+          task_id: task.taskId,
+          title: task.title
+        }
+      );
+    } catch (error) {
+      auditUpdated = false;
+      auditError = errorMessage(error);
+    }
+
+    return {
+      dispatchId,
+      taskId: task.taskId,
+      title: task.title,
+      target,
+
+      dispatchMode,
+      skill,
+      recommendedSkill: task.recommendedSkill,
+
+      taskFilePath: task.taskFilePath,
+      prompt,
+
+      confirmed: true,
+      submit,
+      sent: true,
+
+      statusBefore: task.status,
+      statusAfter,
+
+      bridgeResult,
+
+      auditUpdated,
+      auditError,
+      taskWrite,
+
+      safety: {
+        requiredExplicitConfirmation: true,
+        submitDefault: false,
+        permissionAutoConfirmAllowed: false,
+        automaticLoopAllowed: false
+      }
+    };
+  } catch (error) {
+    const dispatchError = errorMessage(error);
+
+    const failedAt = new Date().toISOString();
+
+    const failedDispatch: Record<string, unknown> = {
+      dispatch_id: dispatchId,
+      dispatched_at: failedAt,
+      result: "failed",
+
+      target,
+      dispatch_mode: dispatchMode,
+      skill,
+      recommended_skill: task.recommendedSkill,
+
+      task_file_path: task.taskFilePath,
+
+      submit,
+      error: dispatchError,
+
+      status_before: task.status,
+      status_after: "dispatch_failed"
+    };
+
+    let auditFailure: string | undefined;
+
+    try {
+      const failedPayload = updatedPayloadWithDispatch(
+        task,
+        "dispatch_failed",
+        failedDispatch
+      );
+
+      await writeStoredReviewExecutionTask(
+        config,
+        guard,
+        workspace,
+        task,
+        failedPayload
+      );
+
+      await appendHistory(
+        guard,
+        workspace,
+        task.historyPath,
+        "dispatch_failed",
+        {
+          ...failedDispatch,
+          task_id: task.taskId,
+          title: task.title
+        }
+      );
+    } catch (auditError) {
+      auditFailure = errorMessage(auditError);
+    }
+
+    throw new CodexProError(
+      `Review execution task dispatch failed: ${dispatchError}` +
+        (auditFailure
+          ? ` Audit update also failed: ${auditFailure}`
+          : "")
+    );
+  }
 }
