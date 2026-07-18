@@ -330,7 +330,7 @@ function serverInstructions(config: CodexProConfig): string {
     "7. Skill rule: do not auto-select skills. Only call load_skill when the user explicitly names a skill, including user skills under ~/.claude/skills, or when .claude/WEBGPT.md names a specific required skill. Treat SKILL.md and references as guidance, not as permission to execute scripts or read secrets.",
     "8. Claude Code bridge rule: only send text to Claude Code when the user explicitly asks. Use list_claude_code_targets first if the target is unclear. Default to submit=false unless the user clearly asks to send/execute/submit. Use capture_claude_output when the user asks for raw recent Claude Code output. Use inspect_claude_code_status when the user asks whether Claude Code is done, running, waiting for input, waiting for permission, or when continuing from its visible response. Use sync_claude_code_status when the user asks to save, persist, synchronize, or share Claude Code status with the workspace. capture_claude_output and inspect_claude_code_status are read-only; sync_claude_code_status reads recent tmux pane text and writes bounded status snapshots under the workspace. inspect_claude_code_status is heuristic and must not be treated as full Claude state. Do not answer Claude Code permission prompts, do not auto-confirm permissions, do not run tmux through bash, and do not use the bridge as a shell.",
     "9. Review handoff rule: after reviewing code, use create_review_execution_task to create the structured .ai-bridge task. Do not send it automatically. When the user asks to preview or send the current task, use dispatch_review_execution_task. The actual Claude Code Skill must come from the current dispatch request, not automatically from the task JSON. Always preview unless the user explicitly confirms sending. Default submit=false. Never confirm Claude Code permission prompts and never start an automatic dispatch loop.",
-    "10. Review result rule: when the user asks whether the dispatched review task is complete, asks to inspect Claude Code's implementation result, or asks WebGPT to review the completed changes, call inspect_review_execution_result. Treat Claude terminal status and claude-execution-result.json as execution evidence only. Never declare the code accepted solely from likely_done, completed, or the Claude-authored report. When ready_for_webgpt_review is true, read every file in files_to_read, compare the actual code with the original findings and allowed files, evaluate test evidence, and present the review conclusion to the user before creating or dispatching another task.",
+    "10. Review result rule: when the user asks whether the dispatched review task is complete, asks to inspect Claude Code's implementation result, or asks WebGPT to review the completed changes, call inspect_review_execution_result. Treat Claude terminal status and claude-execution-result.json as execution evidence only. Never declare the code accepted solely from likely_done, completed, or the Claude-authored report. When ready_for_webgpt_review is true, call show_changes first and treat the real repository status and diff as the source of truth for files actually changed. Compare the real changed-file set with the Claude-authored changed_files report, review deleted files from the diff, then read every non-deleted file in files_to_read. Never declare acceptance while acceptance_blocked is true. Present the review conclusion to the user before creating or dispatching another task.",
     config.codexSessions !== "off"
       ? `7. Codex session history access is enabled in ${config.codexSessions} mode. Use it only when the user asks for local Codex session history.`
       : "",
@@ -2516,7 +2516,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         result.promptForClaude,
         fence,
         "",
-        "Next step: review the returned prompt. If it is correct, call send_to_claude_code with submit=false, or paste it manually into the Claude Code terminal. In file_reference mode, Claude Code will be asked to read the task file itself. In skill_file_reference mode, the prompt starts with a direct slash command."
+        "Next step: review the returned prompt. After explicit user confirmation, call dispatch_review_execution_task. Do not call send_to_claude_code directly for this review task because that would bypass task-id validation, lifecycle updates, Skill dispatch handling, and audit history."
       ].join("\n");
   
       return textResult(text, {
@@ -2905,6 +2905,9 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         `Claude status: ${result.claude.status}`,
         `Claude confidence: ${result.claude.confidence ?? "(none)"}`,
         `Ready for WebGPT review: ${result.verification.readyForWebGPTReview}`,
+        `Acceptance blocked: ${result.verification.acceptanceBlocked}`,
+        `Failed tests reported: ${result.verification.hasFailedTests}`,
+        `Unverified tests reported: ${result.verification.hasUnverifiedTests}`,
         `Requires user action: ${result.verification.requiresUserAction}`,
         `Suggested action: ${result.verification.suggestedAction}`,
         "",
@@ -2928,6 +2931,15 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         "## Scope Check",
         "",
         ...scopeWarnings,
+        "",
+
+        "## Deleted Files",
+        "",
+        ...(result.verification.deletedFiles.length
+          ? result.verification.deletedFiles.map(
+              (file) => `- ${file}`
+            )
+          : ["- None reported."]),
         "",
   
         "## Remaining Issues",
@@ -2970,7 +2982,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
   
         "",
         result.verification.readyForWebGPTReview
-          ? "Next step: use the workspace read tool to read every path in files_to_read. Independently review the actual code before accepting the task."
+          ? "Next step: call show_changes first, compare the real repository diff with the reported changed_files, review deleted_files from the diff, then read every non-deleted path in files_to_read. Do not accept the task while acceptance_blocked is true."
           : "The result is not yet ready for normal WebGPT code acceptance. Follow suggested_action and the reasons above.",
   
         "",
@@ -3055,6 +3067,18 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
   
           files_to_read:
             result.verification.filesToRead,
+
+          deleted_files:
+            result.verification.deletedFiles,
+
+          has_failed_tests:
+            result.verification.hasFailedTests,
+
+          has_unverified_tests:
+            result.verification.hasUnverifiedTests,
+
+          acceptance_blocked:
+            result.verification.acceptanceBlocked,
   
           out_of_scope_files:
             result.verification

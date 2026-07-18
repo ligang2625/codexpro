@@ -986,11 +986,17 @@ function optionalStoredString(
 function normalizeStoredLifecycleStatus(
   value: unknown
 ): ReviewExecutionTaskLifecycleStatus {
+  if (value === undefined || value === null || value === "draft") {
+    return "draft";
+  }
+
   if (value === "pasted") return "pasted";
   if (value === "submitted") return "submitted";
   if (value === "dispatch_failed") return "dispatch_failed";
 
-  return "draft";
+  throw new CodexProError(
+    `Invalid review execution task lifecycle status: ${String(value)}`
+  );
 }
 
 function normalizeStoredPromptMode(
@@ -1609,7 +1615,7 @@ export async function createReviewExecutionTask(
     buildInitialExecutionResultPayload({
       taskId,
       title,
-      taskFilePath: files.executionTaskMarkdown,
+      taskFilePath,
       createdAt
     });
   

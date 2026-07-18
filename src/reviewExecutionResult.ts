@@ -129,7 +129,12 @@ export interface InspectReviewExecutionResultResult {
   verification: {
     readyForWebGPTReview: boolean;
     filesToRead: string[];
+    deletedFiles: string[];
     outOfScopeFiles: string[];
+
+    hasFailedTests: boolean;
+    hasUnverifiedTests: boolean;
+    acceptanceBlocked: boolean;
 
     requiresUserAction: boolean;
     suggestedAction: ReviewExecutionSuggestedAction;
@@ -657,9 +662,8 @@ async function readExecutionResult(
     validationErrors
   );
 
-  const parsedStatus =
-    validationErrors.length > 0 &&
-    !normalizedStatus
+  const parsedStatus: ClaudeExecutionResultStatus =
+    validationErrors.length > 0
       ? "invalid"
       : normalizedStatus ?? "invalid";
 
@@ -782,9 +786,15 @@ function buildVerificationDecision(input: {
   const reasons: string[] = [];
 
   if (input.dispatchStatus === "draft") {
-    reasons.push(
-      "The task lifecycle is still draft; CodexPro has no recorded dispatch."
-    );
+    return {
+      readyForWebGPTReview: false,
+      requiresUserAction: false,
+      suggestedAction: "inspect_failure",
+      reasons: [
+        "The task lifecycle is still draft; CodexPro has no recorded dispatch.",
+        "Do not accept an execution result for a task that was never dispatched."
+      ]
+    };
   }
 
   if (input.claudeStatus === "waiting_permission") {
@@ -972,6 +982,10 @@ function historyEventForStatus(
     return "execution_result_failed";
   }
 
+  if (status === "needs_input") {
+    return "execution_result_needs_input";
+  }
+
   if (status === "invalid") {
     return "execution_result_invalid";
   }
@@ -1120,9 +1134,14 @@ export async function inspectReviewExecutionResult(
   }
 
   const filesToRead =
-    parsedResult.changedFiles.map(
-      (item) => item.path
-    );
+    parsedResult.changedFiles
+      .filter((item) => item.changeType !== "deleted")
+      .map((item) => item.path);
+
+  const deletedFiles =
+    parsedResult.changedFiles
+      .filter((item) => item.changeType === "deleted")
+      .map((item) => item.path);
 
   const outOfScopeFiles =
     parsedResult.changedFiles
@@ -1146,12 +1165,33 @@ export async function inspectReviewExecutionResult(
     claudeStatus
   });
 
+  const hasFailedTests = parsedResult.tests.some(
+    (item) => item.status === "failed"
+  );
+
+  const hasUnverifiedTests = parsedResult.tests.some(
+    (item) =>
+      item.status === "not_run" ||
+      item.status === "unknown"
+  );
+
+  const acceptanceBlocked =
+    parsedResult.status !== "completed" ||
+    task.status === "draft" ||
+    parsedResult.validationErrors.length > 0 ||
+    outOfScopeFiles.length > 0 ||
+    hasFailedTests;
+
   const reviewChecklist = [
-    "Read every path in filesToRead using the workspace read tool.",
+    "Call show_changes before reading reported files. Treat the real repository status and diff as the source of truth for files actually changed.",
+    "Compare the real changed-file set from show_changes with Claude Code's reported changedFiles, and report missing or unexpected files.",
+    "Read every non-deleted path in filesToRead using the workspace read tool.",
+    "Review deletedFiles through show_changes or the repository diff instead of trying to read deleted paths.",
     "Compare the actual implementation with the original review findings.",
-    "Check whether any changed file is outside allowedFiles.",
+    "Check whether any real or reported changed file is outside allowedFiles.",
     "Do not treat Claude Code's result report as proof that the implementation is correct.",
     "Check build, test, lint, or typecheck evidence against the actual project scripts.",
+    "Do not declare acceptance while acceptanceBlocked is true.",
     "Inspect remainingIssues and risks before declaring the task accepted.",
     "Do not automatically dispatch a follow-up task; present the review conclusion to the user first."
   ];
@@ -1182,7 +1222,11 @@ export async function inspectReviewExecutionResult(
           decision.readyForWebGPTReview,
 
         changed_files: filesToRead,
+        deleted_files: deletedFiles,
         out_of_scope_files: outOfScopeFiles,
+        has_failed_tests: hasFailedTests,
+        has_unverified_tests: hasUnverifiedTests,
+        acceptance_blocked: acceptanceBlocked,
 
         suggested_action:
           decision.suggestedAction
@@ -1248,7 +1292,12 @@ export async function inspectReviewExecutionResult(
         decision.readyForWebGPTReview,
 
       filesToRead,
+      deletedFiles,
       outOfScopeFiles,
+
+      hasFailedTests,
+      hasUnverifiedTests,
+      acceptanceBlocked,
 
       requiresUserAction:
         decision.requiresUserAction,
