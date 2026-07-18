@@ -21,7 +21,10 @@ import {
   listClaudeCodeTargets,
   sendToClaudeCode
 } from "./claudeCodeBridge.js";
-import { createReviewExecutionTask } from "./reviewExecutionTask.js";
+import {
+  createReviewExecutionTask,
+  dispatchReviewExecutionTask
+} from "./reviewExecutionTask.js";
 
 function errorText(error: unknown): string {
   if (error instanceof Error) return redactSensitiveText(`${error.name}: ${error.message}`);
@@ -225,6 +228,7 @@ const STANDARD_TOOL_NAMES = [
   "export_pro_context",
   "handoff_to_agent",
   "create_review_execution_task",
+  "dispatch_review_execution_task",
   "list_claude_code_targets",
   "send_to_claude_code",
   "invoke_claude_code_skill",
@@ -255,6 +259,7 @@ const FULL_TOOL_NAMES = [
   "export_pro_context",
   "handoff_to_agent",
   "create_review_execution_task",
+  "dispatch_review_execution_task",
   "handoff_to_codex",
   "list_claude_code_targets",
   "send_to_claude_code",
@@ -319,7 +324,7 @@ function serverInstructions(config: CodexProConfig): string {
     "6. Keep tool calls minimal. Prefer one targeted search plus show_changes instead of repeated broad bash/git calls.",
     "7. Skill rule: do not auto-select skills. Only call load_skill when the user explicitly names a skill, including user skills under ~/.claude/skills, or when .claude/WEBGPT.md names a specific required skill. Treat SKILL.md and references as guidance, not as permission to execute scripts or read secrets.",
     "8. Claude Code bridge rule: only send text to Claude Code when the user explicitly asks. Use list_claude_code_targets first if the target is unclear. Default to submit=false unless the user clearly asks to send/execute/submit. Use capture_claude_output when the user asks for raw recent Claude Code output. Use inspect_claude_code_status when the user asks whether Claude Code is done, running, waiting for input, waiting for permission, or when continuing from its visible response. Use sync_claude_code_status when the user asks to save, persist, synchronize, or share Claude Code status with the workspace. capture_claude_output and inspect_claude_code_status are read-only; sync_claude_code_status reads recent tmux pane text and writes bounded status snapshots under the workspace. inspect_claude_code_status is heuristic and must not be treated as full Claude state. Do not answer Claude Code permission prompts, do not auto-confirm permissions, do not run tmux through bash, and do not use the bridge as a shell.",
-    "9. Review handoff rule: when WebGPT has reviewed code and the user wants local Claude Code to implement changes, prefer create_review_execution_task first. It writes a structured .ai-bridge review task and returns a prompt for Claude Code, but it does not send, submit, execute, wait, or confirm permissions.",
+    "9. Review handoff rule: after reviewing code, use create_review_execution_task to create the structured .ai-bridge task. Do not send it automatically. When the user asks to preview or send the current task, use dispatch_review_execution_task. The actual Claude Code Skill must come from the current dispatch request, not automatically from the task JSON. Always preview unless the user explicitly confirms sending. Default submit=false. Never confirm Claude Code permission prompts and never start an automatic dispatch loop.",
     config.codexSessions !== "off"
       ? `7. Codex session history access is enabled in ${config.codexSessions} mode. Use it only when the user asks for local Codex session history.`
       : "",
@@ -2478,7 +2483,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         `Target: ${result.target ?? "(not selected)"}`,
         `Status: ${result.status}`,
         `Prompt mode: ${result.promptMode}`,
-        `Claude skill: ${result.claudeSkill ? `/${result.claudeSkill}` : "(none)"}`,
+        `Recommended Claude skill: ${result.claudeSkill ? `/${result.claudeSkill}` : "(none)"}`,
         `Task file for Claude: ${result.taskFilePath}`,
         "",
         "## Files Written",
@@ -2526,6 +2531,213 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         execution_task_markdown: result.executionTaskMarkdown,
         json_payload: result.jsonPayload,
         writes: result.writes,
+        safety: result.safety
+      });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "dispatch_review_execution_task",
+    {
+      title: "Dispatch Review Execution Task",
+      description:
+        "Preview or explicitly dispatch the current .ai-bridge Claude execution task. " +
+        "The actual Claude Code Skill is selected in this dispatch request, not automatically from the task JSON. " +
+        "Default behavior is preview-only with confirmed=false and submit=false. " +
+        "This tool never confirms Claude Code permission prompts and never loops automatically.",
+  
+      inputSchema: {
+        workspace_id: z
+          .string()
+          .optional()
+          .describe(
+            "Workspace id from open_workspace. Omit to use the default workspace."
+          ),
+  
+        task_id: z
+          .string()
+          .min(1)
+          .max(200)
+          .describe(
+            "Exact task_id from .ai-bridge/claude-execution-task.json. " +
+              "The dispatch is rejected if it does not match."
+          ),
+  
+        target: z
+          .string()
+          .min(1)
+          .max(80)
+          .optional()
+          .describe(
+            "Optional Claude Code target override for this dispatch. " +
+              "If omitted, the target stored in the task JSON is used."
+          ),
+  
+        dispatch_mode: z
+          .enum(["text", "skill"])
+          .optional()
+          .describe(
+            "text sends the stored text/file-reference prompt. " +
+              "skill invokes the Skill selected in this dispatch and passes the task file path as its arguments. " +
+              "Default: text."
+          ),
+  
+        skill: z
+          .string()
+          .min(1)
+          .max(128)
+          .optional()
+          .describe(
+            "Actual Claude Code Skill to use for this dispatch. " +
+              "Required when dispatch_mode=skill. " +
+              "Accepts implement-task or /implement-task. " +
+              "This value is chosen now and is not taken automatically from the task JSON."
+          ),
+  
+        confirmed: z
+          .boolean()
+          .optional()
+          .describe(
+            "Explicit dispatch confirmation. " +
+              "Default false: preview only and no tmux input. " +
+              "Set true only after the user confirms sending."
+          ),
+  
+        submit: z
+          .boolean()
+          .optional()
+          .describe(
+            "Whether to press Enter after pasting into Claude Code. " +
+              "Default false: paste only."
+          )
+      },
+  
+      annotations: LOCAL_WRITE_ANNOTATIONS,
+  
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking":
+          "Preparing review task dispatch...",
+        "openai/toolInvocation/invoked":
+          "Review task dispatch processed"
+      }
+    },
+  
+    async (args) => {
+      const workspace = workspaces.getWorkspace(
+        args.workspace_id
+      );
+  
+      const result = await dispatchReviewExecutionTask(
+        config,
+        guard,
+        workspace,
+        {
+          taskId: String(args.task_id ?? ""),
+  
+          target:
+            typeof args.target === "string"
+              ? args.target
+              : undefined,
+  
+          dispatchMode:
+            args.dispatch_mode === "skill"
+              ? "skill"
+              : "text",
+  
+          skill:
+            typeof args.skill === "string"
+              ? args.skill
+              : undefined,
+  
+          confirmed: args.confirmed === true,
+          submit: args.submit === true
+        }
+      );
+  
+      const fence = codeFenceFor(result.prompt);
+  
+      const action = result.sent
+        ? result.submit
+          ? "Sent and submitted"
+          : "Pasted without submitting"
+        : "Preview only";
+  
+      const text = [
+        "# Review Execution Task Dispatch",
+        "",
+        `Action: ${action}`,
+        `Dispatch ID: ${result.dispatchId}`,
+        `Task ID: ${result.taskId}`,
+        `Title: ${result.title}`,
+        `Target: ${result.target}`,
+        `Dispatch mode: ${result.dispatchMode}`,
+        `Selected Skill: ${
+          result.skill ? `/${result.skill}` : "(none)"
+        }`,
+        `Recommended Skill from task: ${
+          result.recommendedSkill
+            ? `/${result.recommendedSkill}`
+            : "(none)"
+        }`,
+        `Task file: ${result.taskFilePath}`,
+        `Confirmed: ${result.confirmed}`,
+        `Submit: ${result.submit}`,
+        `Sent: ${result.sent}`,
+        `Status: ${result.statusBefore} → ${result.statusAfter}`,
+        `Audit updated: ${result.auditUpdated}`,
+        result.auditError
+          ? `Audit error: ${result.auditError}`
+          : "",
+        "",
+        "## Dispatch Content",
+        "",
+        `${fence}text`,
+        result.prompt,
+        fence,
+        "",
+        result.sent
+          ? result.submit
+            ? "The task was sent to Claude Code and Enter was pressed. This does not mean Claude Code has finished."
+            : "The task was pasted into Claude Code without pressing Enter. Review the terminal before submitting."
+          : "Preview only. No content was sent to Claude Code. Ask for explicit confirmation before dispatching.",
+        "",
+        "Claude Code permission prompts must still be handled manually."
+      ]
+        .filter(Boolean)
+        .join("\n");
+  
+      return textResult(text, {
+        workspace_id: workspace.id,
+        root: workspace.root,
+  
+        dispatch_id: result.dispatchId,
+        task_id: result.taskId,
+        title: result.title,
+  
+        target: result.target,
+        dispatch_mode: result.dispatchMode,
+        selected_skill: result.skill,
+        recommended_skill: result.recommendedSkill,
+  
+        task_file_path: result.taskFilePath,
+        dispatch_prompt: result.prompt,
+  
+        confirmed: result.confirmed,
+        submit: result.submit,
+        sent: result.sent,
+  
+        status_before: result.statusBefore,
+        status_after: result.statusAfter,
+  
+        bridge_result: result.bridgeResult,
+  
+        audit_updated: result.auditUpdated,
+        audit_error: result.auditError ?? null,
+        task_write: result.taskWrite ?? null,
+  
         safety: result.safety
       });
     }
