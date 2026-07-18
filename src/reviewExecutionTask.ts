@@ -9,6 +9,15 @@ import { listClaudeCodeTargets } from "./claudeCodeBridge.js";
 
 export type ReviewFindingPriority = "low" | "medium" | "high";
 
+export type ReviewExecutionPromptMode =
+  | "inline"
+  | "file_reference"
+  | "skill_file_reference";
+
+export type ReviewExecutionTaskFileForClaude =
+  | "execution_task"
+  | "review_plan";
+
 export interface ReviewExecutionFindingInput {
   file?: string;
   issue: string;
@@ -27,6 +36,31 @@ export interface CreateReviewExecutionTaskInput {
   forbiddenActions?: string[];
   testInstructions?: string[];
   extraContext?: string;
+
+  /**
+   * inline:
+   *   Return the full task prompt for Claude Code.
+   *
+   * file_reference:
+   *   Return a short prompt that tells Claude Code to read the handoff file.
+   *
+   * skill_file_reference:
+   *   Return a direct slash command such as:
+   *   /implement-task .ai-bridge/claude-execution-task.md
+   */
+  promptMode?: ReviewExecutionPromptMode;
+
+  /**
+   * Required when promptMode=skill_file_reference.
+   * Can be passed as "implement-task" or "/implement-task".
+   */
+  claudeSkill?: string;
+
+  /**
+   * Which handoff file Claude Code should be asked to read.
+   * Default: execution_task.
+   */
+  taskFileForClaude?: ReviewExecutionTaskFileForClaude;
 }
 
 export interface ReviewExecutionTaskFiles {
@@ -41,8 +75,25 @@ export interface CreateReviewExecutionTaskResult {
   target: string | null;
   title: string;
   status: "draft";
+
+  promptMode: ReviewExecutionPromptMode;
+  claudeSkill: string | null;
+  taskFileForClaude: ReviewExecutionTaskFileForClaude;
+  taskFilePath: string;
+
   files: ReviewExecutionTaskFiles;
+
+  /**
+   * The short or inline prompt that should be sent to Claude Code
+   * only after user confirmation.
+   */
   promptForClaude: string;
+
+  /**
+   * The full execution instructions saved into claude-execution-task.md.
+   */
+  executionInstructions: string;
+
   reviewPlanMarkdown: string;
   executionTaskMarkdown: string;
   jsonPayload: Record<string, unknown>;
@@ -176,6 +227,95 @@ function cleanStringList(value: unknown, fieldName: string, maxItems = MAX_LIST_
 function normalizePriority(value: unknown): ReviewFindingPriority {
   if (value === "low" || value === "medium" || value === "high") return value;
   return "medium";
+}
+
+function normalizePromptMode(value: unknown): ReviewExecutionPromptMode {
+  if (value === "inline") return "inline";
+  if (value === "skill_file_reference") return "skill_file_reference";
+  return "file_reference";
+}
+
+function normalizeTaskFileForClaude(value: unknown): ReviewExecutionTaskFileForClaude {
+  if (value === "review_plan") return "review_plan";
+  return "execution_task";
+}
+
+function normalizeClaudeSkill(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+
+  const raw = String(value).trim();
+  if (!raw) return null;
+
+  const skill = raw.startsWith("/") ? raw.slice(1).trim() : raw;
+
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$/.test(skill)) {
+    throw new CodexProError(
+      "claudeSkill must be a Claude Code slash skill name using letters, numbers, dots, underscores, or hyphens. Example: implement-task or /implement-task."
+    );
+  }
+
+  return skill;
+}
+
+function taskFilePathForClaude(
+  files: ReviewExecutionTaskFiles,
+  taskFileForClaude: ReviewExecutionTaskFileForClaude
+): string {
+  return taskFileForClaude === "review_plan"
+    ? files.reviewPlanMarkdown
+    : files.executionTaskMarkdown;
+}
+
+function buildFileReferencePrompt(taskFilePath: string): string {
+  return [
+    "请读取并执行以下 Claude Code 任务文件：",
+    "",
+    taskFilePath,
+    "",
+    "执行要求：",
+    "- 先阅读任务文件内容。",
+    "- 只按任务文件中的允许修改范围进行最小必要修改。",
+    "- 不要扩大任务范围。",
+    "- 不要自动确认任何权限请求；如遇权限提示，请停下来让用户人工确认。",
+    "- 完成后请汇报修改文件、修改原因、测试结果和剩余风险。"
+  ].join("\n");
+}
+
+function buildSkillFileReferencePrompt(skill: string, taskFilePath: string): string {
+  return [
+    `/${skill} ${taskFilePath}`,
+    "",
+    "请先读取上述任务文件，再按该 Skill 的流程执行。",
+    "",
+    "执行要求：",
+    "- 只处理任务文件中定义的范围。",
+    "- 不要扩大任务范围。",
+    "- 不要自动确认任何权限请求；如遇权限提示，请停下来让用户人工确认。",
+    "- 完成后请汇报修改文件、修改原因、测试结果和剩余风险。"
+  ].join("\n");
+}
+
+function buildPromptForClaudeByMode(input: {
+  promptMode: ReviewExecutionPromptMode;
+  claudeSkill: string | null;
+  taskFilePath: string;
+  executionInstructions: string;
+}): string {
+  if (input.promptMode === "inline") {
+    return input.executionInstructions;
+  }
+
+  if (input.promptMode === "skill_file_reference") {
+    if (!input.claudeSkill) {
+      throw new CodexProError(
+        "claudeSkill is required when promptMode is skill_file_reference."
+      );
+    }
+
+    return buildSkillFileReferencePrompt(input.claudeSkill, input.taskFilePath);
+  }
+
+  return buildFileReferencePrompt(input.taskFilePath);
 }
 
 function priorityRank(priority: ReviewFindingPriority): number {
@@ -405,7 +545,7 @@ function buildExecutionTaskMarkdown(input: {
   taskId: string;
   target: string | null;
   title: string;
-  promptForClaude: string;
+  executionInstructions: string;
   reviewPlanPath: string;
   jsonPath: string;
   createdAt: string;
@@ -428,11 +568,9 @@ function buildExecutionTaskMarkdown(input: {
     "- Auto-permission-confirm allowed: false",
     "- Auto-loop allowed: false",
     "",
-    "## Prompt For Claude Code",
+    "## Execution Instructions",
     "",
-    "```text",
-    input.promptForClaude,
-    "```",
+    input.executionInstructions,
     ""
   ].join("\n");
 }
@@ -448,13 +586,20 @@ function buildJsonPayload(input: {
   forbiddenActions: string[];
   testInstructions: string[];
   extraContext?: string;
+
+  promptMode: ReviewExecutionPromptMode;
+  claudeSkill: string | null;
+  taskFileForClaude: ReviewExecutionTaskFileForClaude;
+  taskFilePath: string;
   promptForClaude: string;
+  executionInstructions: string;
+
   files: ReviewExecutionTaskFiles;
   workspace: Workspace;
   createdAt: string;
 }): Record<string, unknown> {
   return {
-    schema_version: 1,
+    schema_version: 2,
     kind: "webgpt_review_execution_task",
     task_id: input.taskId,
     created_at: input.createdAt,
@@ -463,6 +608,7 @@ function buildJsonPayload(input: {
     target: input.target,
     title: input.title,
     status: "draft",
+
     review_goal: input.reviewGoal,
     reviewed_files: input.reviewedFiles,
     findings: input.findings,
@@ -470,13 +616,30 @@ function buildJsonPayload(input: {
     forbidden_actions: input.forbiddenActions,
     test_instructions: input.testInstructions,
     extra_context: input.extraContext ?? null,
+
+    prompt_mode: input.promptMode,
+    claude_skill: input.claudeSkill,
+    task_file_for_claude: input.taskFileForClaude,
+    task_file_path: input.taskFilePath,
+
+    /**
+     * This is what WebGPT should send to Claude Code after user confirmation.
+     * It may be a short file-reference prompt, a direct slash command, or a full inline task.
+     */
     prompt_for_claude: input.promptForClaude,
+
+    /**
+     * This is the full execution task content saved in claude-execution-task.md.
+     */
+    execution_instructions: input.executionInstructions,
+
     files: {
       review_plan_markdown: input.files.reviewPlanMarkdown,
       execution_task_markdown: input.files.executionTaskMarkdown,
       execution_task_json: input.files.executionTaskJson,
       history_jsonl: input.files.historyJsonl
     },
+
     safety: {
       requires_user_confirmation: true,
       submit_default: false,
@@ -530,12 +693,24 @@ export async function createReviewExecutionTask(
   const testInstructions = cleanStringList(rawInput.testInstructions, "testInstructions", 80);
   const extraContext = cleanOptionalText(rawInput.extraContext, "extraContext", 10_000);
 
+  const promptMode = normalizePromptMode(rawInput.promptMode);
+  const claudeSkill = normalizeClaudeSkill(rawInput.claudeSkill);
+  const taskFileForClaude = normalizeTaskFileForClaude(rawInput.taskFileForClaude);
+
+  if (promptMode === "skill_file_reference" && !claudeSkill) {
+    throw new CodexProError(
+      "claudeSkill is required when promptMode is skill_file_reference."
+    );
+  }
+
   const files: ReviewExecutionTaskFiles = {
     reviewPlanMarkdown: `${config.contextDir}/webgpt-review-plan.md`,
     executionTaskMarkdown: `${config.contextDir}/claude-execution-task.md`,
     executionTaskJson: `${config.contextDir}/claude-execution-task.json`,
     historyJsonl: `${config.contextDir}/review-task-history.jsonl`
   };
+
+  const taskFilePath = taskFilePathForClaude(files, taskFileForClaude);
 
   const reviewPlanMarkdown = buildReviewPlanMarkdown({
     taskId,
@@ -552,7 +727,7 @@ export async function createReviewExecutionTask(
     createdAt
   });
 
-  const promptForClaude = buildPromptForClaude({
+  const executionInstructions = buildPromptForClaude({
     taskId,
     title,
     reviewGoal,
@@ -564,11 +739,18 @@ export async function createReviewExecutionTask(
     extraContext
   });
 
+  const promptForClaude = buildPromptForClaudeByMode({
+    promptMode,
+    claudeSkill,
+    taskFilePath,
+    executionInstructions
+  });
+
   const executionTaskMarkdown = buildExecutionTaskMarkdown({
     taskId,
     target,
     title,
-    promptForClaude,
+    executionInstructions,
     reviewPlanPath: files.reviewPlanMarkdown,
     jsonPath: files.executionTaskJson,
     createdAt
@@ -585,16 +767,30 @@ export async function createReviewExecutionTask(
     forbiddenActions,
     testInstructions,
     extraContext,
+
+    promptMode,
+    claudeSkill,
+    taskFileForClaude,
+    taskFilePath,
     promptForClaude,
+    executionInstructions,
+
     files,
     workspace,
     createdAt
   });
 
-  const reviewWrite = await writeTextFile(config, guard, workspace, files.reviewPlanMarkdown, reviewPlanMarkdown, {
-    createDirs: true,
-    overwrite: true
-  });
+  const reviewWrite = await writeTextFile(
+    config,
+    guard,
+    workspace,
+    files.reviewPlanMarkdown,
+    reviewPlanMarkdown,
+    {
+      createDirs: true,
+      overwrite: true
+    }
+  );
 
   const executionWrite = await writeTextFile(
     config,
@@ -608,15 +804,26 @@ export async function createReviewExecutionTask(
     }
   );
 
-  const jsonWrite = await writeTextFile(config, guard, workspace, files.executionTaskJson, `${JSON.stringify(jsonPayload, null, 2)}\n`, {
-    createDirs: true,
-    overwrite: true
-  });
+  const jsonWrite = await writeTextFile(
+    config,
+    guard,
+    workspace,
+    files.executionTaskJson,
+    `${JSON.stringify(jsonPayload, null, 2)}\n`,
+    {
+      createDirs: true,
+      overwrite: true
+    }
+  );
 
   await appendHistory(guard, workspace, files.historyJsonl, {
     task_id: taskId,
     target,
     title,
+    prompt_mode: promptMode,
+    claude_skill: claudeSkill,
+    task_file_for_claude: taskFileForClaude,
+    task_file_path: taskFilePath,
     review_plan_markdown: files.reviewPlanMarkdown,
     execution_task_markdown: files.executionTaskMarkdown,
     execution_task_json: files.executionTaskJson
@@ -627,11 +834,19 @@ export async function createReviewExecutionTask(
     target,
     title,
     status: "draft",
+
+    promptMode,
+    claudeSkill,
+    taskFileForClaude,
+    taskFilePath,
+
     files,
     promptForClaude,
+    executionInstructions,
     reviewPlanMarkdown,
     executionTaskMarkdown,
     jsonPayload,
+
     writes: {
       reviewPlanMarkdown: {
         path: reviewWrite.path,
@@ -652,6 +867,7 @@ export async function createReviewExecutionTask(
         deletions: jsonWrite.diff.deletions
       }
     },
+
     safety: {
       requiresUserConfirmation: true,
       submitDefault: false,
