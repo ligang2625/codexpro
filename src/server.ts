@@ -28,6 +28,9 @@ import {
 import {
   inspectReviewExecutionResult
 } from "./reviewExecutionResult.js";
+import {
+  recordReviewVerification
+} from "./reviewVerification.js";
 
 function errorText(error: unknown): string {
   if (error instanceof Error) return redactSensitiveText(`${error.name}: ${error.message}`);
@@ -233,6 +236,7 @@ const STANDARD_TOOL_NAMES = [
   "create_review_execution_task",
   "dispatch_review_execution_task",
   "inspect_review_execution_result",
+  "record_review_verification",
   "list_claude_code_targets",
   "send_to_claude_code",
   "invoke_claude_code_skill",
@@ -265,6 +269,7 @@ const FULL_TOOL_NAMES = [
   "create_review_execution_task",
   "dispatch_review_execution_task",
   "inspect_review_execution_result",
+  "record_review_verification",
   "handoff_to_codex",
   "list_claude_code_targets",
   "send_to_claude_code",
@@ -331,6 +336,7 @@ function serverInstructions(config: CodexProConfig): string {
     "8. Claude Code bridge rule: only send text to Claude Code when the user explicitly asks. Use list_claude_code_targets first if the target is unclear. Default to submit=false unless the user clearly asks to send/execute/submit. Use capture_claude_output when the user asks for raw recent Claude Code output. Use inspect_claude_code_status when the user asks whether Claude Code is done, running, waiting for input, waiting for permission, or when continuing from its visible response. Use sync_claude_code_status when the user asks to save, persist, synchronize, or share Claude Code status with the workspace. capture_claude_output and inspect_claude_code_status are read-only; sync_claude_code_status reads recent tmux pane text and writes bounded status snapshots under the workspace. inspect_claude_code_status is heuristic and must not be treated as full Claude state. Do not answer Claude Code permission prompts, do not auto-confirm permissions, do not run tmux through bash, and do not use the bridge as a shell.",
     "9. Review handoff rule: after reviewing code, use create_review_execution_task to create the structured .ai-bridge task. Do not send it automatically. When the user asks to preview or send the current task, use dispatch_review_execution_task. The actual Claude Code Skill must come from the current dispatch request, not automatically from the task JSON. Always preview unless the user explicitly confirms sending. Default submit=false. Never confirm Claude Code permission prompts and never start an automatic dispatch loop.",
     "10. Review result rule: when the user asks whether the dispatched review task is complete, asks to inspect Claude Code's implementation result, or asks WebGPT to review the completed changes, call inspect_review_execution_result. Treat Claude terminal status and claude-execution-result.json as execution evidence only. Never declare the code accepted solely from likely_done, completed, or the Claude-authored report. When ready_for_webgpt_review is true, call show_changes first and treat the real repository status and diff as the source of truth for files actually changed. Compare the real changed-file set with the Claude-authored changed_files report, review deleted files from the diff, then read every non-deleted file in files_to_read. Never declare acceptance while acceptance_blocked is true. Present the review conclusion to the user before creating or dispatching another task.",
+    "11. WebGPT verification rule: after independently reviewing the real repository changes, use record_review_verification to preview a structured accepted, revision_required, or blocked verdict. Pass the exact execution_result_digest returned by inspect_review_execution_result. Default confirmed=false. Only set confirmed=true after the user confirms recording the verdict. Never accept a stale digest, never bypass the Acceptance Gate, and never create or dispatch a revision task automatically.",
     config.codexSessions !== "off"
       ? `7. Codex session history access is enabled in ${config.codexSessions} mode. Use it only when the user asks for local Codex session history.`
       : "",
@@ -2901,6 +2907,9 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         `Title: ${result.title}`,
         `Dispatch status: ${result.dispatchStatus}`,
         `Result status: ${result.result.status}`,
+        `Execution result digest: ${result.result.digest ?? "(unavailable)"}`,
+        `Stored verification: ${result.verification.record.state}`,
+        `Stored verdict: ${result.verification.record.verdict ?? "(none)"}`,
         `Claude target: ${result.target ?? "(not checked)"}`,
         `Claude status: ${result.claude.status}`,
         `Claude confidence: ${result.claude.confidence ?? "(none)"}`,
@@ -3009,6 +3018,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
             result.result.markdownPath,
   
           status: result.result.status,
+          digest: result.result.digest,
           summary: result.result.summary,
   
           changed_files:
@@ -3097,7 +3107,20 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
   
           review_checklist:
             result.verification
-              .reviewChecklist
+              .reviewChecklist,
+
+          record: {
+            path: result.verification.record.path,
+            markdown_path:
+              result.verification.record.markdownPath,
+            state: result.verification.record.state,
+            verdict: result.verification.record.verdict,
+            execution_result_digest:
+              result.verification.record.executionResultDigest,
+            recorded_at:
+              result.verification.record.recordedAt,
+            error: result.verification.record.error
+          }
         },
   
         review_context: {
@@ -3123,6 +3146,476 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         },
   
         audit: result.audit
+      });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "record_review_verification",
+    {
+      title: "Record WebGPT Verification",
+
+      description:
+        "Preview or explicitly record WebGPT's independent verification verdict for the current review task. " +
+        "The exact Execution Result digest from inspect_review_execution_result is required to prevent stale acceptance. " +
+        "Default behavior is preview-only with confirmed=false. This tool never sends to Claude Code, confirms permissions, or starts a revision loop.",
+
+      inputSchema: {
+        workspace_id: z
+          .string()
+          .optional()
+          .describe(
+            "Workspace id from open_workspace. Omit to use the default workspace."
+          ),
+
+        task_id: z
+          .string()
+          .min(1)
+          .max(200)
+          .describe(
+            "Exact task_id from .ai-bridge/claude-execution-task.json."
+          ),
+
+        execution_result_digest: z
+          .string()
+          .regex(/^[a-fA-F0-9]{64}$/)
+          .describe(
+            "Exact SHA-256 digest returned by inspect_review_execution_result after WebGPT reviewed the current real repository changes."
+          ),
+
+        verdict: z
+          .enum([
+            "accepted",
+            "revision_required",
+            "blocked"
+          ])
+          .describe(
+            "WebGPT's independent verdict. accepted is rejected unless every server-side Acceptance Gate check passes."
+          ),
+
+        summary: z
+          .string()
+          .min(1)
+          .max(20_000)
+          .describe(
+            "Concise independent verification conclusion and rationale."
+          ),
+
+        finding_results: z
+          .array(
+            z.object({
+              finding_index: z
+                .number()
+                .int()
+                .min(1),
+              status: z.enum([
+                "verified",
+                "unresolved",
+                "blocked"
+              ]),
+              summary: z
+                .string()
+                .min(1)
+                .max(8_000),
+              evidence: z
+                .array(z.string().min(1).max(4_000))
+                .max(100)
+                .optional()
+            })
+          )
+          .min(1)
+          .max(80)
+          .describe(
+            "Exactly one item for every original finding, using the 1-based order returned in review_context.findings."
+          ),
+
+        test_evidence: z
+          .array(
+            z.object({
+              instruction_index: z
+                .number()
+                .int()
+                .min(1)
+                .optional(),
+              command: z
+                .string()
+                .min(1)
+                .max(4_000)
+                .optional(),
+              status: z.enum([
+                "passed",
+                "failed",
+                "not_run",
+                "insufficient_evidence"
+              ]),
+              summary: z
+                .string()
+                .min(1)
+                .max(12_000),
+              evidence: z
+                .array(z.string().min(1).max(4_000))
+                .max(100)
+                .optional()
+            })
+          )
+          .max(200)
+          .optional()
+          .describe(
+            "WebGPT's independent assessment of test evidence. instruction_index is 1-based against review_context.test_instructions."
+          ),
+
+        remaining_issue_results: z
+          .array(
+            z.object({
+              issue_index: z
+                .number()
+                .int()
+                .min(1),
+              status: z.enum([
+                "resolved",
+                "unresolved",
+                "blocked"
+              ]),
+              summary: z
+                .string()
+                .min(1)
+                .max(8_000),
+              evidence: z
+                .array(z.string().min(1).max(4_000))
+                .max(100)
+                .optional()
+            })
+          )
+          .max(200)
+          .optional()
+          .describe(
+            "Assessments for Claude-reported remaining_issues, using 1-based order. accepted requires complete resolved coverage."
+          ),
+
+        risk_results: z
+          .array(
+            z.object({
+              risk_index: z
+                .number()
+                .int()
+                .min(1),
+              status: z.enum([
+                "accepted",
+                "resolved",
+                "unresolved",
+                "blocked"
+              ]),
+              summary: z
+                .string()
+                .min(1)
+                .max(8_000),
+              evidence: z
+                .array(z.string().min(1).max(4_000))
+                .max(100)
+                .optional()
+            })
+          )
+          .max(200)
+          .optional()
+          .describe(
+            "Assessments for Claude-reported risks, using 1-based order. accepted requires complete non-blocking coverage."
+          ),
+
+        reviewed_files: z
+          .array(z.string().min(1).max(2_000))
+          .max(500)
+          .optional()
+          .describe(
+            "Real non-deleted changed files that WebGPT actually read and independently reviewed."
+          ),
+
+        actual_changed_files: z
+          .array(
+            z.object({
+              path: z.string().min(1).max(2_000),
+              change_type: z.enum([
+                "created",
+                "modified",
+                "deleted",
+                "renamed",
+                "unknown"
+              ]),
+              summary: z
+                .string()
+                .min(1)
+                .max(8_000)
+                .optional()
+            })
+          )
+          .max(500)
+          .optional()
+          .describe(
+            "Real changed-file set observed from show_changes/git diff. It is compared with Claude's changed_files report and allowed_files."
+          ),
+
+        deleted_file_results: z
+          .array(
+            z.object({
+              path: z.string().min(1).max(2_000),
+              status: z.enum([
+                "expected",
+                "unexpected",
+                "blocked"
+              ]),
+              summary: z
+                .string()
+                .min(1)
+                .max(8_000),
+              evidence: z
+                .array(z.string().min(1).max(4_000))
+                .max(100)
+                .optional()
+            })
+          )
+          .max(500)
+          .optional()
+          .describe(
+            "Explicit review of every actual deleted file. accepted requires every deletion to be covered and expected."
+          ),
+
+        forbidden_action_violations: z
+          .array(z.string().min(1).max(4_000))
+          .max(200)
+          .optional()
+          .describe(
+            "Observed violations of the task's forbidden_actions. Any item blocks accepted."
+          ),
+
+        confirmed: z
+          .boolean()
+          .optional()
+          .describe(
+            "Explicit confirmation to write Verification JSON/Markdown and append audit history. Default false: preview only."
+          )
+      },
+
+      annotations: HANDOFF_WRITE_ANNOTATIONS,
+
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking":
+          "Checking WebGPT verification...",
+        "openai/toolInvocation/invoked":
+          "WebGPT verification processed"
+      }
+    },
+
+    async (args) => {
+      const workspace = workspaces.getWorkspace(
+        args.workspace_id
+      );
+
+      const result = await recordReviewVerification(
+        config,
+        guard,
+        workspace,
+        {
+          taskId: String(args.task_id ?? ""),
+          executionResultDigest: String(
+            args.execution_result_digest ?? ""
+          ),
+          verdict: args.verdict,
+          summary: String(args.summary ?? ""),
+
+          findingResults: Array.isArray(args.finding_results)
+            ? args.finding_results.map((item: any) => ({
+                findingIndex: Number(item.finding_index),
+                status: item.status,
+                summary: String(item.summary ?? ""),
+                evidence: Array.isArray(item.evidence)
+                  ? item.evidence.map(String)
+                  : undefined
+              }))
+            : [],
+
+          testEvidence: Array.isArray(args.test_evidence)
+            ? args.test_evidence.map((item: any) => ({
+                instructionIndex:
+                  typeof item.instruction_index === "number"
+                    ? item.instruction_index
+                    : undefined,
+                command:
+                  typeof item.command === "string"
+                    ? item.command
+                    : undefined,
+                status: item.status,
+                summary: String(item.summary ?? ""),
+                evidence: Array.isArray(item.evidence)
+                  ? item.evidence.map(String)
+                  : undefined
+              }))
+            : undefined,
+
+          remainingIssueResults:
+            Array.isArray(args.remaining_issue_results)
+              ? args.remaining_issue_results.map((item: any) => ({
+                  issueIndex: Number(item.issue_index),
+                  status: item.status,
+                  summary: String(item.summary ?? ""),
+                  evidence: Array.isArray(item.evidence)
+                    ? item.evidence.map(String)
+                    : undefined
+                }))
+              : undefined,
+
+          riskResults: Array.isArray(args.risk_results)
+            ? args.risk_results.map((item: any) => ({
+                riskIndex: Number(item.risk_index),
+                status: item.status,
+                summary: String(item.summary ?? ""),
+                evidence: Array.isArray(item.evidence)
+                  ? item.evidence.map(String)
+                  : undefined
+              }))
+            : undefined,
+
+          reviewedFiles: Array.isArray(args.reviewed_files)
+            ? args.reviewed_files.map(String)
+            : undefined,
+
+          actualChangedFiles:
+            Array.isArray(args.actual_changed_files)
+              ? args.actual_changed_files.map((item: any) => ({
+                  path: String(item.path ?? ""),
+                  changeType: item.change_type,
+                  summary:
+                    typeof item.summary === "string"
+                      ? item.summary
+                      : undefined
+                }))
+              : undefined,
+
+          deletedFileResults:
+            Array.isArray(args.deleted_file_results)
+              ? args.deleted_file_results.map((item: any) => ({
+                  path: String(item.path ?? ""),
+                  status: item.status,
+                  summary: String(item.summary ?? ""),
+                  evidence: Array.isArray(item.evidence)
+                    ? item.evidence.map(String)
+                    : undefined
+                }))
+              : undefined,
+
+          forbiddenActionViolations:
+            Array.isArray(args.forbidden_action_violations)
+              ? args.forbidden_action_violations.map(String)
+              : undefined,
+
+          confirmed: args.confirmed === true
+        }
+      );
+
+      const failedChecks = result.acceptanceGate.checks
+        .filter((item) => !item.passed)
+        .map((item) => `- FAIL [${item.code}] ${item.message}`);
+
+      const passedChecks = result.acceptanceGate.checks
+        .filter((item) => item.passed)
+        .map((item) => `- PASS [${item.code}] ${item.message}`);
+
+      const action = result.recorded
+        ? result.idempotent
+          ? "Already recorded; duplicate audit write skipped"
+          : "Verification recorded"
+        : "Preview only; no files or audit history were written";
+
+      const text = [
+        "# WebGPT Verification",
+        "",
+        `Action: ${action}`,
+        `Task ID: ${result.taskId}`,
+        `Title: ${result.title}`,
+        `Verdict: ${result.verdict}`,
+        `Confirmed: ${result.confirmed}`,
+        `Can record: ${result.canRecord}`,
+        `Acceptance Gate: ${result.acceptanceGate.passed ? "passed" : "failed"}`,
+        `Execution Result Digest: ${result.currentExecutionResultDigest}`,
+        `Verification Signature: ${result.verificationSignature}`,
+        `JSON: ${result.files.json}`,
+        `Markdown: ${result.files.markdown}`,
+        `Audit updated: ${result.audit.updated}`,
+        result.audit.error
+          ? `Audit error: ${result.audit.error}`
+          : "",
+        "",
+        "## Gate Checks",
+        "",
+        ...passedChecks,
+        ...failedChecks,
+        "",
+        "## File Reconciliation",
+        "",
+        `Reported changed files: ${result.fileReview.reportedChangedFiles.length}`,
+        `Actual changed files: ${result.fileReview.actualChangedFiles.length}`,
+        `Out-of-scope files: ${result.fileReview.outOfScopeFiles.length}`,
+        `Unreported changed files: ${result.fileReview.unreportedChangedFiles.length}`,
+        `Reported but not observed files: ${result.fileReview.reportedButNotObservedFiles.length}`,
+        `Unreviewed changed files: ${result.fileReview.unreviewedChangedFiles.length}`,
+        "",
+        result.recorded
+          ? "This records WebGPT's verification only. It does not dispatch a new task or interact with Claude Code."
+          : "Review this preview with the user. Set confirmed=true only after explicit confirmation to record it.",
+        "",
+        "No revision task was created or dispatched."
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      return textResult(text, {
+        workspace_id: workspace.id,
+        root: workspace.root,
+
+        task_id: result.taskId,
+        title: result.title,
+        verdict: result.verdict,
+
+        confirmed: result.confirmed,
+        recorded: result.recorded,
+        idempotent: result.idempotent,
+        can_record: result.canRecord,
+
+        execution_result_digest:
+          result.executionResultDigest,
+        current_execution_result_digest:
+          result.currentExecutionResultDigest,
+        verification_signature:
+          result.verificationSignature,
+
+        files: result.files,
+
+        file_review: {
+          reviewed_files:
+            result.fileReview.reviewedFiles,
+          reported_changed_files:
+            result.fileReview.reportedChangedFiles,
+          actual_changed_files:
+            result.fileReview.actualChangedFiles,
+          deleted_files:
+            result.fileReview.deletedFiles,
+          out_of_scope_files:
+            result.fileReview.outOfScopeFiles,
+          unreported_changed_files:
+            result.fileReview.unreportedChangedFiles,
+          reported_but_not_observed_files:
+            result.fileReview.reportedButNotObservedFiles,
+          unreviewed_changed_files:
+            result.fileReview.unreviewedChangedFiles
+        },
+
+        acceptance_gate: result.acceptanceGate,
+        json_payload: result.jsonPayload,
+        verification_markdown: result.markdown,
+        writes: result.writes,
+        audit: result.audit,
+        safety: result.safety
       });
     }
   );

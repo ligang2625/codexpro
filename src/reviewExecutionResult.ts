@@ -1,5 +1,6 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { createHash } from "node:crypto";
 
 import type { CodexProConfig } from "./config.js";
 
@@ -88,6 +89,7 @@ export interface InspectReviewExecutionResultResult {
     markdownPath: string;
 
     status: ClaudeExecutionResultStatus;
+    digest: string | null;
     summary: string;
 
     changedFiles: ClaudeExecutionChangedFile[];
@@ -141,6 +143,8 @@ export interface InspectReviewExecutionResultResult {
 
     reasons: string[];
     reviewChecklist: string[];
+
+    record: ReviewVerificationRecordSummary;
   };
 
   reviewContext: {
@@ -158,7 +162,33 @@ export interface InspectReviewExecutionResultResult {
   };
 }
 
-interface ParsedExecutionResult {
+export type ReviewVerificationRecordState =
+  | "not_recorded"
+  | "current"
+  | "stale"
+  | "invalid";
+
+export type ReviewVerificationVerdict =
+  | "accepted"
+  | "revision_required"
+  | "blocked";
+
+export interface ReviewVerificationRecordSummary {
+  path: string;
+  markdownPath: string;
+  state: ReviewVerificationRecordState;
+  verdict: ReviewVerificationVerdict | null;
+  executionResultDigest: string | null;
+  recordedAt: string | null;
+  error: string | null;
+}
+
+export interface ParsedExecutionResult {
+  schemaVersion: number | null;
+  taskId: string | null;
+  digest: string | null;
+  normalizedPayload: Record<string, unknown> | null;
+
   status: ClaudeExecutionResultStatus;
   summary: string;
 
@@ -497,6 +527,34 @@ function normalizeNeedsInput(
   };
 }
 
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  }
+
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+
+  return `{${keys
+    .map(
+      (key) =>
+        `${JSON.stringify(key)}:${canonicalJson(record[key])}`
+    )
+    .join(",")}}`;
+}
+
+export function computeExecutionResultDigest(
+  normalizedPayload: Record<string, unknown>
+): string {
+  return createHash("sha256")
+    .update(canonicalJson(normalizedPayload), "utf8")
+    .digest("hex");
+}
+
 async function resultFileExists(
   guard: PathGuard,
   workspace: Workspace,
@@ -523,13 +581,41 @@ async function resultFileExists(
   }
 }
 
-async function readExecutionResult(
+export async function readExecutionResult(
   config: CodexProConfig,
   guard: PathGuard,
   workspace: Workspace,
   resultPath: string,
   expectedTaskId: string
 ): Promise<ParsedExecutionResult> {
+  const emptyResult = (
+    status: "missing" | "invalid",
+    validationErrors: string[]
+  ): ParsedExecutionResult => ({
+    schemaVersion: null,
+    taskId: null,
+    digest: null,
+    normalizedPayload: null,
+
+    status,
+    summary: "",
+
+    changedFiles: [],
+    changeSummary: [],
+
+    tests: [],
+    remainingIssues: [],
+    risks: [],
+
+    needsInput: null,
+
+    startedAt: null,
+    completedAt: null,
+    updatedAt: null,
+
+    validationErrors
+  });
+
   const exists = await resultFileExists(
     guard,
     workspace,
@@ -537,27 +623,9 @@ async function readExecutionResult(
   );
 
   if (!exists) {
-    return {
-      status: "missing",
-      summary: "",
-
-      changedFiles: [],
-      changeSummary: [],
-
-      tests: [],
-      remainingIssues: [],
-      risks: [],
-
-      needsInput: null,
-
-      startedAt: null,
-      completedAt: null,
-      updatedAt: null,
-
-      validationErrors: [
-        `Execution result file does not exist: ${resultPath}`
-      ]
-    };
+    return emptyResult("missing", [
+      `Execution result file does not exist: ${resultPath}`
+    ]);
   }
 
   const resolved = guard.resolve(
@@ -580,29 +648,11 @@ async function readExecutionResult(
   try {
     parsed = JSON.parse(raw);
   } catch (error) {
-    return {
-      status: "invalid",
-      summary: "",
-
-      changedFiles: [],
-      changeSummary: [],
-
-      tests: [],
-      remainingIssues: [],
-      risks: [],
-
-      needsInput: null,
-
-      startedAt: null,
-      completedAt: null,
-      updatedAt: null,
-
-      validationErrors: [
-        `Invalid execution result JSON: ${errorMessage(
-          error
-        )}`
-      ]
-    };
+    return emptyResult("invalid", [
+      `Invalid execution result JSON: ${errorMessage(
+        error
+      )}`
+    ]);
   }
 
   const payload = objectValue(parsed);
@@ -662,52 +712,237 @@ async function readExecutionResult(
     validationErrors
   );
 
+  const summary =
+    optionalString(payload.summary, 40_000) ?? "";
+
+  const changeSummary = stringList(
+    payload.change_summary
+  );
+
+  const tests = normalizeTests(payload.tests);
+
+  const remainingIssues = stringList(
+    payload.remaining_issues
+  );
+
+  const risks = stringList(payload.risks);
+
+  const needsInput = normalizeNeedsInput(
+    payload.needs_input
+  );
+
+  const startedAt = optionalString(
+    payload.started_at,
+    200
+  );
+
+  const completedAt = optionalString(
+    payload.completed_at,
+    200
+  );
+
+  const updatedAt = optionalString(
+    payload.updated_at,
+    200
+  );
+
   const parsedStatus: ClaudeExecutionResultStatus =
     validationErrors.length > 0
       ? "invalid"
       : normalizedStatus ?? "invalid";
 
-  return {
-    status: parsedStatus,
+  const normalizedPayload: Record<string, unknown> = {
+    schema_version: Number.isInteger(schemaVersion)
+      ? schemaVersion
+      : null,
+    kind:
+      payload.kind === "claude_execution_result"
+        ? payload.kind
+        : null,
+    task_id: resultTaskId || null,
+    status: normalizedStatus,
+    summary,
+    changed_files: changedFiles.map((item) => ({
+      path: item.path,
+      change_type: item.changeType,
+      summary: item.summary
+    })),
+    change_summary: changeSummary,
+    tests: tests.map((item) => ({
+      command: item.command,
+      status: item.status,
+      summary: item.summary
+    })),
+    remaining_issues: remainingIssues,
+    risks,
+    needs_input: needsInput
+      ? {
+          question: needsInput.question,
+          context: needsInput.context
+        }
+      : null,
+    started_at: startedAt,
+    completed_at: completedAt,
+    updated_at: updatedAt
+  };
 
-    summary:
-      optionalString(payload.summary, 40_000) ?? "",
+  return {
+    schemaVersion:
+      Number.isInteger(schemaVersion)
+        ? schemaVersion
+        : null,
+    taskId: resultTaskId || null,
+    digest:
+      validationErrors.length === 0
+        ? computeExecutionResultDigest(normalizedPayload)
+        : null,
+    normalizedPayload,
+
+    status: parsedStatus,
+    summary,
 
     changedFiles,
+    changeSummary,
 
-    changeSummary: stringList(
-      payload.change_summary
-    ),
+    tests,
+    remainingIssues,
+    risks,
 
-    tests: normalizeTests(payload.tests),
+    needsInput,
 
-    remainingIssues: stringList(
-      payload.remaining_issues
-    ),
-
-    risks: stringList(payload.risks),
-
-    needsInput: normalizeNeedsInput(
-      payload.needs_input
-    ),
-
-    startedAt: optionalString(
-      payload.started_at,
-      200
-    ),
-
-    completedAt: optionalString(
-      payload.completed_at,
-      200
-    ),
-
-    updatedAt: optionalString(
-      payload.updated_at,
-      200
-    ),
+    startedAt,
+    completedAt,
+    updatedAt,
 
     validationErrors
   };
+}
+
+async function readVerificationRecordSummary(
+  config: CodexProConfig,
+  guard: PathGuard,
+  workspace: Workspace,
+  input: {
+    jsonPath: string;
+    markdownPath: string;
+    expectedTaskId: string;
+    currentExecutionResultDigest: string | null;
+  }
+): Promise<ReviewVerificationRecordSummary> {
+  const notRecorded: ReviewVerificationRecordSummary = {
+    path: input.jsonPath,
+    markdownPath: input.markdownPath,
+    state: "not_recorded",
+    verdict: null,
+    executionResultDigest: null,
+    recordedAt: null,
+    error: null
+  };
+
+  const exists = await resultFileExists(
+    guard,
+    workspace,
+    input.jsonPath
+  );
+
+  if (!exists) return notRecorded;
+
+  try {
+    const resolved = guard.resolve(
+      workspace,
+      input.jsonPath
+    );
+
+    await guard.assertTextFile(
+      resolved.absPath,
+      Math.min(config.maxReadBytes, 1_000_000)
+    );
+
+    const raw = await fsp.readFile(
+      resolved.absPath,
+      "utf8"
+    );
+
+    const payload = objectValue(JSON.parse(raw));
+
+    if (payload.kind !== "webgpt_review_verification") {
+      throw new CodexProError(
+        "Verification kind must be webgpt_review_verification."
+      );
+    }
+
+    const schemaVersion = Number(
+      payload.schema_version ?? 1
+    );
+
+    if (schemaVersion !== 1) {
+      throw new CodexProError(
+        `Unsupported verification schema_version: ${String(
+          payload.schema_version
+        )}`
+      );
+    }
+
+    const taskId = String(
+      payload.task_id ?? ""
+    ).trim();
+
+    if (taskId !== input.expectedTaskId) {
+      throw new CodexProError(
+        `Verification task_id does not match the current task. ` +
+          `Expected ${input.expectedTaskId}, received ${taskId || "(missing)"}.`
+      );
+    }
+
+    const verdict = payload.verdict;
+
+    if (
+      verdict !== "accepted" &&
+      verdict !== "revision_required" &&
+      verdict !== "blocked"
+    ) {
+      throw new CodexProError(
+        `Unsupported verification verdict: ${String(verdict)}`
+      );
+    }
+
+    const digest = String(
+      payload.execution_result_digest ?? ""
+    ).trim();
+
+    if (!/^[a-f0-9]{64}$/.test(digest)) {
+      throw new CodexProError(
+        "Verification execution_result_digest is missing or invalid."
+      );
+    }
+
+    const lifecycle = objectValue(payload.lifecycle);
+    const recordedAt = optionalString(
+      lifecycle.recorded_at ??
+        payload.verified_at ??
+        payload.updated_at,
+      200
+    );
+
+    return {
+      path: input.jsonPath,
+      markdownPath: input.markdownPath,
+      state:
+        input.currentExecutionResultDigest === digest
+          ? "current"
+          : "stale",
+      verdict,
+      executionResultDigest: digest,
+      recordedAt,
+      error: null
+    };
+  } catch (error) {
+    return {
+      ...notRecorded,
+      state: "invalid",
+      error: errorMessage(error)
+    };
+  }
 }
 
 function resolveOptionalTarget(
@@ -1087,6 +1322,19 @@ export async function inspectReviewExecutionResult(
     task.taskId
   );
 
+  const verificationRecord =
+    await readVerificationRecordSummary(
+      config,
+      guard,
+      workspace,
+      {
+        jsonPath: task.verificationJsonPath,
+        markdownPath: task.verificationMarkdownPath,
+        expectedTaskId: task.taskId,
+        currentExecutionResultDigest: parsedResult.digest
+      }
+    );
+
   const target = resolveOptionalTarget(
     rawInput.target,
     task.target
@@ -1179,8 +1427,10 @@ export async function inspectReviewExecutionResult(
     parsedResult.status !== "completed" ||
     task.status === "draft" ||
     parsedResult.validationErrors.length > 0 ||
+    parsedResult.digest === null ||
     outOfScopeFiles.length > 0 ||
-    hasFailedTests;
+    hasFailedTests ||
+    hasUnverifiedTests;
 
   const reviewChecklist = [
     "Call show_changes before reading reported files. Treat the real repository status and diff as the source of truth for files actually changed.",
@@ -1214,6 +1464,9 @@ export async function inspectReviewExecutionResult(
         dispatch_status: task.status,
 
         result_status: parsedResult.status,
+        execution_result_digest: parsedResult.digest,
+        verification_state: verificationRecord.state,
+        verification_verdict: verificationRecord.verdict,
 
         claude_status: claudeStatus,
         claude_confidence: claudeConfidence,
@@ -1246,6 +1499,7 @@ export async function inspectReviewExecutionResult(
       markdownPath: task.resultMarkdownPath,
 
       status: parsedResult.status,
+      digest: parsedResult.digest,
       summary: parsedResult.summary,
 
       changedFiles:
@@ -1306,7 +1560,8 @@ export async function inspectReviewExecutionResult(
         decision.suggestedAction,
 
       reasons: decision.reasons,
-      reviewChecklist
+      reviewChecklist,
+      record: verificationRecord
     },
 
     reviewContext: {

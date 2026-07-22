@@ -156,6 +156,9 @@ export interface StoredReviewExecutionTask {
   resultMarkdownPath: string;
   resultJsonPath: string;
 
+  verificationMarkdownPath: string;
+  verificationJsonPath: string;
+
   historyPath: string;
 }
 
@@ -211,6 +214,9 @@ export interface ReviewExecutionTaskFiles {
 
   executionResultMarkdown: string;
   executionResultJson: string;
+
+  verificationResultMarkdown: string;
+  verificationResultJson: string;
 
   historyJsonl: string;
 }
@@ -709,6 +715,8 @@ function buildExecutionTaskMarkdown(input: {
   jsonPath: string;
   resultMarkdownPath: string;
   resultJsonPath: string;
+  verificationMarkdownPath: string;
+  verificationJsonPath: string;
   createdAt: string;
 }): string {
   return [
@@ -722,6 +730,8 @@ function buildExecutionTaskMarkdown(input: {
     `Task JSON: ${input.jsonPath}`,
     `Execution result Markdown: ${input.resultMarkdownPath}`,
     `Execution result JSON: ${input.resultJsonPath}`,
+    `WebGPT verification Markdown: ${input.verificationMarkdownPath}`,
+    `WebGPT verification JSON: ${input.verificationJsonPath}`,
     "",
     "## Send Policy",
     "",
@@ -817,7 +827,7 @@ function buildJsonPayload(input: {
   createdAt: string;
 }): Record<string, unknown> {
   return {
-    schema_version: 3,
+    schema_version: 4,
     kind: "webgpt_review_execution_task",
     task_id: input.taskId,
     created_at: input.createdAt,
@@ -869,6 +879,9 @@ function buildJsonPayload(input: {
     
       execution_result_markdown: input.files.executionResultMarkdown,
       execution_result_json: input.files.executionResultJson,
+
+      verification_result_markdown: input.files.verificationResultMarkdown,
+      verification_result_json: input.files.verificationResultJson,
     
       history_jsonl: input.files.historyJsonl
     },
@@ -879,6 +892,16 @@ function buildJsonPayload(input: {
       consumer_tool: "inspect_review_execution_result",
       result_markdown: input.files.executionResultMarkdown,
       result_json: input.files.executionResultJson
+    },
+
+    verification_contract: {
+      schema_version: 1,
+      producer: "webgpt",
+      consumer_tool: "record_review_verification",
+      verification_markdown: input.files.verificationResultMarkdown,
+      verification_json: input.files.verificationResultJson,
+      verdicts: ["accepted", "revision_required", "blocked"],
+      requires_execution_result_digest: true
     },
     
     lifecycle: {
@@ -1193,11 +1216,12 @@ export async function readStoredReviewExecutionTask(
 
   /*
    * 第三轮将任务 schema 升级到 3。
+   * 第四轮新增 Verification 文件与契约，将 schema 升级到 4。
    */
   if (
     !Number.isInteger(schemaVersion) ||
     schemaVersion < 1 ||
-    schemaVersion > 3
+    schemaVersion > 4
   ) {
     throw new CodexProError(
       `Unsupported review execution task schema_version: ${String(
@@ -1303,6 +1327,22 @@ export async function readStoredReviewExecutionTask(
       "files.execution_result_json"
     );
 
+  const verificationMarkdownPath =
+    normalizeAiBridgeRelativePath(
+      config,
+      files.verification_result_markdown ??
+        `${config.contextDir}/webgpt-verification-result.md`,
+      "files.verification_result_markdown"
+    );
+
+  const verificationJsonPath =
+    normalizeAiBridgeRelativePath(
+      config,
+      files.verification_result_json ??
+        `${config.contextDir}/webgpt-verification-result.json`,
+      "files.verification_result_json"
+    );
+
   const historyPath =
     normalizeAiBridgeRelativePath(
       config,
@@ -1389,6 +1429,9 @@ export async function readStoredReviewExecutionTask(
 
     resultMarkdownPath,
     resultJsonPath,
+
+    verificationMarkdownPath,
+    verificationJsonPath,
 
     historyPath
   };
@@ -1549,6 +1592,9 @@ export async function createReviewExecutionTask(
   
     executionResultMarkdown: `${config.contextDir}/claude-execution-result.md`,
     executionResultJson: `${config.contextDir}/claude-execution-result.json`,
+
+    verificationResultMarkdown: `${config.contextDir}/webgpt-verification-result.md`,
+    verificationResultJson: `${config.contextDir}/webgpt-verification-result.json`,
   
     historyJsonl: `${config.contextDir}/review-task-history.jsonl`
   };
@@ -1600,6 +1646,8 @@ export async function createReviewExecutionTask(
   
     resultMarkdownPath: files.executionResultMarkdown,
     resultJsonPath: files.executionResultJson,
+    verificationMarkdownPath: files.verificationResultMarkdown,
+    verificationJsonPath: files.verificationResultJson,
   
     createdAt
   });
@@ -1720,7 +1768,9 @@ export async function createReviewExecutionTask(
       execution_task_markdown: files.executionTaskMarkdown,
       execution_task_json: files.executionTaskJson,
       execution_result_markdown: files.executionResultMarkdown,
-      execution_result_json: files.executionResultJson
+      execution_result_json: files.executionResultJson,
+      verification_result_markdown: files.verificationResultMarkdown,
+      verification_result_json: files.verificationResultJson
     }
   );
 
