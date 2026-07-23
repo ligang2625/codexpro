@@ -33,6 +33,15 @@ export type ReviewExecutionTaskLifecycleStatus =
   | "submitted"
   | "dispatch_failed";
 
+export interface ReviewTaskLineage {
+  rootTaskId: string;
+  parentTaskId: string | null;
+  revisionNumber: number;
+  sourceVerificationSignature: string | null;
+  sourceExecutionResultDigest: string | null;
+  sourceVerdict: "revision_required" | null;
+}
+
 export interface DispatchReviewExecutionTaskInput {
   /**
    * Must exactly match task_id in claude-execution-task.json.
@@ -136,6 +145,7 @@ export interface StoredReviewExecutionTask {
   taskId: string;
   title: string;
   status: ReviewExecutionTaskLifecycleStatus;
+  lineage: ReviewTaskLineage;
 
   target: string | null;
   promptMode: ReviewExecutionPromptMode;
@@ -172,6 +182,18 @@ export interface ReviewExecutionFindingInput {
 
 export interface CreateReviewExecutionTaskInput {
   target?: string;
+
+  /**
+   * Internal deterministic task id used by create_review_revision_task.
+   * The MCP create_review_execution_task tool does not expose this field.
+   */
+  taskId?: string;
+
+  /**
+   * Internal lineage supplied by create_review_revision_task.
+   * Ordinary tasks receive a root lineage automatically.
+   */
+  lineage?: ReviewTaskLineage;
   title: string;
   reviewGoal: string;
   reviewedFiles?: string[];
@@ -226,6 +248,7 @@ export interface CreateReviewExecutionTaskResult {
   target: string | null;
   title: string;
   status: "draft";
+  lineage: ReviewTaskLineage;
 
   promptMode: ReviewExecutionPromptMode;
   claudeSkill: string | null;
@@ -386,6 +409,132 @@ function cleanStringList(value: unknown, fieldName: string, maxItems = MAX_LIST_
   }
 
   return [...new Set(out)];
+}
+
+
+function normalizeTaskId(value: unknown, fieldName: string): string {
+  const taskId = cleanOneLine(value, fieldName, 200);
+
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(taskId)) {
+    throw new CodexProError(
+      `${fieldName} must use only letters, numbers, dots, underscores, and hyphens.`
+    );
+  }
+
+  return taskId;
+}
+
+function normalizeLineage(
+  value: unknown,
+  taskId: string
+): ReviewTaskLineage {
+  if (value === undefined || value === null) {
+    return {
+      rootTaskId: taskId,
+      parentTaskId: null,
+      revisionNumber: 0,
+      sourceVerificationSignature: null,
+      sourceExecutionResultDigest: null,
+      sourceVerdict: null
+    };
+  }
+
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new CodexProError("lineage must be an object.");
+  }
+
+  const record = value as Record<string, unknown>;
+  const rootTaskId = normalizeTaskId(
+    record.rootTaskId ?? record.root_task_id,
+    "lineage.rootTaskId"
+  );
+
+  const parentRaw = record.parentTaskId ?? record.parent_task_id;
+  const parentTaskId =
+    parentRaw === undefined || parentRaw === null || String(parentRaw).trim() === ""
+      ? null
+      : normalizeTaskId(parentRaw, "lineage.parentTaskId");
+
+  const revisionNumber = Number(
+    record.revisionNumber ?? record.revision_number ?? 0
+  );
+
+  if (!Number.isInteger(revisionNumber) || revisionNumber < 0 || revisionNumber > 10_000) {
+    throw new CodexProError(
+      "lineage.revisionNumber must be an integer between 0 and 10000."
+    );
+  }
+
+  const sourceVerificationSignature = cleanOptionalOneLine(
+    record.sourceVerificationSignature ??
+      record.source_verification_signature,
+    "lineage.sourceVerificationSignature",
+    64
+  ) ?? null;
+
+  const sourceExecutionResultDigest = cleanOptionalOneLine(
+    record.sourceExecutionResultDigest ??
+      record.source_execution_result_digest,
+    "lineage.sourceExecutionResultDigest",
+    64
+  ) ?? null;
+
+  const sourceVerdictRaw =
+    record.sourceVerdict ?? record.source_verdict;
+  const sourceVerdict =
+    sourceVerdictRaw === "revision_required"
+      ? "revision_required"
+      : null;
+
+  if (revisionNumber === 0) {
+    if (rootTaskId !== taskId || parentTaskId !== null) {
+      throw new CodexProError(
+        "Root tasks must use their own task id as rootTaskId and have no parentTaskId."
+      );
+    }
+
+    return {
+      rootTaskId,
+      parentTaskId: null,
+      revisionNumber: 0,
+      sourceVerificationSignature: null,
+      sourceExecutionResultDigest: null,
+      sourceVerdict: null
+    };
+  }
+
+  if (!parentTaskId) {
+    throw new CodexProError(
+      "Revision tasks require lineage.parentTaskId."
+    );
+  }
+
+  if (!sourceVerificationSignature || !/^[a-f0-9]{64}$/i.test(sourceVerificationSignature)) {
+    throw new CodexProError(
+      "Revision tasks require a valid lineage.sourceVerificationSignature."
+    );
+  }
+
+  if (!sourceExecutionResultDigest || !/^[a-f0-9]{64}$/i.test(sourceExecutionResultDigest)) {
+    throw new CodexProError(
+      "Revision tasks require a valid lineage.sourceExecutionResultDigest."
+    );
+  }
+
+  if (sourceVerdict !== "revision_required") {
+    throw new CodexProError(
+      "Revision tasks require lineage.sourceVerdict=revision_required."
+    );
+  }
+
+  return {
+    rootTaskId,
+    parentTaskId,
+    revisionNumber,
+    sourceVerificationSignature: sourceVerificationSignature.toLowerCase(),
+    sourceExecutionResultDigest: sourceExecutionResultDigest.toLowerCase(),
+    sourceVerdict
+  };
 }
 
 function normalizePriority(value: unknown): ReviewFindingPriority {
@@ -571,7 +720,21 @@ function buildReviewPlanMarkdown(input: {
   extraContext?: string;
   workspace: Workspace;
   createdAt: string;
+  lineage: ReviewTaskLineage;
 }): string {
+  const lineageLines = input.lineage.revisionNumber > 0
+    ? [
+        `Root Task ID: ${input.lineage.rootTaskId}`,
+        `Parent Task ID: ${input.lineage.parentTaskId}`,
+        `Revision Number: ${input.lineage.revisionNumber}`,
+        `Source Verification Signature: ${input.lineage.sourceVerificationSignature}`,
+        `Source Execution Result Digest: ${input.lineage.sourceExecutionResultDigest}`
+      ]
+    : [
+        `Root Task ID: ${input.lineage.rootTaskId}`,
+        "Revision Number: 0"
+      ];
+
   return [
     `# WebGPT Review Plan`,
     "",
@@ -580,6 +743,7 @@ function buildReviewPlanMarkdown(input: {
     `Workspace: ${input.workspace.root}`,
     `Claude Code target: ${input.target ?? "(not selected)"}`,
     `Status: draft`,
+    ...lineageLines,
     "",
     "## Review Goal",
     "",
@@ -631,13 +795,28 @@ function buildPromptForClaude(input: {
   forbiddenActions: string[];
   testInstructions: string[];
   extraContext?: string;
+  lineage: ReviewTaskLineage;
 }): string {
+  const lineageText = input.lineage.revisionNumber > 0
+    ? [
+        "## Revision Lineage",
+        "",
+        `Root Task ID：${input.lineage.rootTaskId}`,
+        `Parent Task ID：${input.lineage.parentTaskId}`,
+        `Revision Number：${input.lineage.revisionNumber}`,
+        "",
+        "本任务是用户确认后创建的修订任务。只处理本轮 findings，不要自动创建或发送下一轮任务。",
+        ""
+      ]
+    : [];
+
   return [
     `你正在执行 WebGPT 生成的代码修改任务。`,
     "",
     `任务 ID：${input.taskId}`,
     `任务标题：${input.title}`,
     "",
+    ...lineageText,
     "## 背景",
     "",
     input.reviewGoal,
@@ -718,6 +897,7 @@ function buildExecutionTaskMarkdown(input: {
   verificationMarkdownPath: string;
   verificationJsonPath: string;
   createdAt: string;
+  lineage: ReviewTaskLineage;
 }): string {
   return [
     "# Claude Code Execution Task",
@@ -726,6 +906,10 @@ function buildExecutionTaskMarkdown(input: {
     `Created: ${input.createdAt}`,
     `Target: ${input.target ?? "(not selected)"}`,
     "Status: draft",
+    `Root Task ID: ${input.lineage.rootTaskId}`,
+    `Parent Task ID: ${input.lineage.parentTaskId ?? "(none)"}`,
+    `Revision Number: ${input.lineage.revisionNumber}`,
+    `Source Verification Signature: ${input.lineage.sourceVerificationSignature ?? "(none)"}`,
     `Review plan: ${input.reviewPlanPath}`,
     `Task JSON: ${input.jsonPath}`,
     `Execution result Markdown: ${input.resultMarkdownPath}`,
@@ -825,9 +1009,10 @@ function buildJsonPayload(input: {
   files: ReviewExecutionTaskFiles;
   workspace: Workspace;
   createdAt: string;
+  lineage: ReviewTaskLineage;
 }): Record<string, unknown> {
   return {
-    schema_version: 4,
+    schema_version: 5,
     kind: "webgpt_review_execution_task",
     task_id: input.taskId,
     created_at: input.createdAt,
@@ -836,6 +1021,17 @@ function buildJsonPayload(input: {
     target: input.target,
     title: input.title,
     status: "draft",
+
+    lineage: {
+      root_task_id: input.lineage.rootTaskId,
+      parent_task_id: input.lineage.parentTaskId,
+      revision_number: input.lineage.revisionNumber,
+      source_verification_signature:
+        input.lineage.sourceVerificationSignature,
+      source_execution_result_digest:
+        input.lineage.sourceExecutionResultDigest,
+      source_verdict: input.lineage.sourceVerdict
+    },
 
     review_goal: input.reviewGoal,
     reviewed_files: input.reviewedFiles,
@@ -1221,7 +1417,7 @@ export async function readStoredReviewExecutionTask(
   if (
     !Number.isInteger(schemaVersion) ||
     schemaVersion < 1 ||
-    schemaVersion > 4
+    schemaVersion > 5
   ) {
     throw new CodexProError(
       `Unsupported review execution task schema_version: ${String(
@@ -1251,6 +1447,11 @@ export async function readStoredReviewExecutionTask(
     normalizeStoredLifecycleStatus(
       lifecycle.status ?? payload.status
     );
+
+  const lineage = normalizeLineage(
+    payload.lineage,
+    taskId
+  );
 
   const target = optionalStoredString(
     payload.target,
@@ -1410,6 +1611,7 @@ export async function readStoredReviewExecutionTask(
     taskId,
     title,
     status,
+    lineage,
 
     target,
     promptMode,
@@ -1563,7 +1765,10 @@ export async function createReviewExecutionTask(
   await ensureAiBridge(config, guard, workspace);
 
   const createdAt = new Date().toISOString();
-  const taskId = `review_${createdAt.replace(/[-:.TZ]/g, "").slice(0, 14)}_${randomUUID().slice(0, 8)}`;
+  const taskId = rawInput.taskId
+    ? normalizeTaskId(rawInput.taskId, "taskId")
+    : `review_${createdAt.replace(/[-:.TZ]/g, "").slice(0, 14)}_${randomUUID().slice(0, 8)}`;
+  const lineage = normalizeLineage(rawInput.lineage, taskId);
 
   const target = validateTarget(rawInput.target);
   const title = cleanOneLine(rawInput.title, "title", MAX_TITLE_LENGTH);
@@ -1613,7 +1818,8 @@ export async function createReviewExecutionTask(
     testInstructions,
     extraContext,
     workspace,
-    createdAt
+    createdAt,
+    lineage
   });
 
   const executionInstructions = buildPromptForClaude({
@@ -1625,7 +1831,8 @@ export async function createReviewExecutionTask(
     allowedFiles,
     forbiddenActions,
     testInstructions,
-    extraContext
+    extraContext,
+    lineage
   });
 
   const promptForClaude = buildPromptForClaudeByMode({
@@ -1649,7 +1856,8 @@ export async function createReviewExecutionTask(
     verificationMarkdownPath: files.verificationResultMarkdown,
     verificationJsonPath: files.verificationResultJson,
   
-    createdAt
+    createdAt,
+    lineage
   });
 
   const initialExecutionResultMarkdown =
@@ -1688,7 +1896,8 @@ export async function createReviewExecutionTask(
 
     files,
     workspace,
-    createdAt
+    createdAt,
+    lineage
   });
 
   const reviewWrite = await writeTextFile(
@@ -1750,6 +1959,28 @@ export async function createReviewExecutionTask(
       overwrite: true
     }
   );
+
+  for (const verificationPath of [
+    files.verificationResultMarkdown,
+    files.verificationResultJson
+  ]) {
+    const resolvedVerification = guard.resolve(
+      workspace,
+      verificationPath,
+      { forWrite: true }
+    );
+
+    try {
+      await fsp.unlink(resolvedVerification.absPath);
+    } catch (error) {
+      const code =
+        error && typeof error === "object" && "code" in error
+          ? String((error as { code?: unknown }).code)
+          : "";
+
+      if (code !== "ENOENT") throw error;
+    }
+  }
   
   await appendHistory(
     guard,
@@ -1770,7 +2001,14 @@ export async function createReviewExecutionTask(
       execution_result_markdown: files.executionResultMarkdown,
       execution_result_json: files.executionResultJson,
       verification_result_markdown: files.verificationResultMarkdown,
-      verification_result_json: files.verificationResultJson
+      verification_result_json: files.verificationResultJson,
+      root_task_id: lineage.rootTaskId,
+      parent_task_id: lineage.parentTaskId,
+      revision_number: lineage.revisionNumber,
+      source_verification_signature:
+        lineage.sourceVerificationSignature,
+      source_execution_result_digest:
+        lineage.sourceExecutionResultDigest
     }
   );
 
@@ -1792,6 +2030,7 @@ export async function createReviewExecutionTask(
     target,
     title,
     status: "draft",
+    lineage,
 
     promptMode,
     claudeSkill,

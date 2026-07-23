@@ -29,6 +29,9 @@ import {
   inspectReviewExecutionResult
 } from "./reviewExecutionResult.js";
 import {
+  createReviewRevisionTask
+} from "./reviewRevision.js";
+import {
   recordReviewVerification
 } from "./reviewVerification.js";
 
@@ -237,6 +240,7 @@ const STANDARD_TOOL_NAMES = [
   "dispatch_review_execution_task",
   "inspect_review_execution_result",
   "record_review_verification",
+  "create_review_revision_task",
   "list_claude_code_targets",
   "send_to_claude_code",
   "invoke_claude_code_skill",
@@ -270,6 +274,7 @@ const FULL_TOOL_NAMES = [
   "dispatch_review_execution_task",
   "inspect_review_execution_result",
   "record_review_verification",
+  "create_review_revision_task",
   "handoff_to_codex",
   "list_claude_code_targets",
   "send_to_claude_code",
@@ -336,7 +341,8 @@ function serverInstructions(config: CodexProConfig): string {
     "8. Claude Code bridge rule: only send text to Claude Code when the user explicitly asks. Use list_claude_code_targets first if the target is unclear. Default to submit=false unless the user clearly asks to send/execute/submit. Use capture_claude_output when the user asks for raw recent Claude Code output. Use inspect_claude_code_status when the user asks whether Claude Code is done, running, waiting for input, waiting for permission, or when continuing from its visible response. Use sync_claude_code_status when the user asks to save, persist, synchronize, or share Claude Code status with the workspace. capture_claude_output and inspect_claude_code_status are read-only; sync_claude_code_status reads recent tmux pane text and writes bounded status snapshots under the workspace. inspect_claude_code_status is heuristic and must not be treated as full Claude state. Do not answer Claude Code permission prompts, do not auto-confirm permissions, do not run tmux through bash, and do not use the bridge as a shell.",
     "9. Review handoff rule: after reviewing code, use create_review_execution_task to create the structured .ai-bridge task. Do not send it automatically. When the user asks to preview or send the current task, use dispatch_review_execution_task. The actual Claude Code Skill must come from the current dispatch request, not automatically from the task JSON. Always preview unless the user explicitly confirms sending. Default submit=false. Never confirm Claude Code permission prompts and never start an automatic dispatch loop.",
     "10. Review result rule: when the user asks whether the dispatched review task is complete, asks to inspect Claude Code's implementation result, or asks WebGPT to review the completed changes, call inspect_review_execution_result. Treat Claude terminal status and claude-execution-result.json as execution evidence only. Never declare the code accepted solely from likely_done, completed, or the Claude-authored report. When ready_for_webgpt_review is true, call show_changes first and treat the real repository status and diff as the source of truth for files actually changed. Compare the real changed-file set with the Claude-authored changed_files report, review deleted files from the diff, then read every non-deleted file in files_to_read. Never declare acceptance while acceptance_blocked is true. Present the review conclusion to the user before creating or dispatching another task.",
-    "11. WebGPT verification rule: after independently reviewing the real repository changes, use record_review_verification to preview a structured accepted, revision_required, or blocked verdict. Pass the exact execution_result_digest returned by inspect_review_execution_result. Default confirmed=false. Only set confirmed=true after the user confirms recording the verdict. Never accept a stale digest, never bypass the Acceptance Gate, and never create or dispatch a revision task automatically.",
+    "11. WebGPT verification rule: after independently reviewing the real repository changes, use record_review_verification to preview a structured accepted, revision_required, or blocked verdict. Pass the exact execution_result_digest returned by inspect_review_execution_result. Default confirmed=false. Only set confirmed=true after the user confirms recording the verdict. Never accept a stale digest and never bypass the Acceptance Gate.",
+    "12. Revision task rule: only when the user explicitly decides to continue from a current revision_required Verification, use create_review_revision_task. Pass the exact source verification signature, account for every unresolved Verification source item as covered or deferred, and preview with confirmed=false. Only set confirmed=true after the user confirms creation. The new task remains draft and must be dispatched separately through dispatch_review_execution_task. Never create branches, never use stale/accepted/blocked Verification, and never start an automatic revision loop.",
     config.codexSessions !== "off"
       ? `7. Codex session history access is enabled in ${config.codexSessions} mode. Use it only when the user asks for local Codex session history.`
       : "",
@@ -2494,6 +2500,9 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         `Title: ${result.title}`,
         `Target: ${result.target ?? "(not selected)"}`,
         `Status: ${result.status}`,
+        `Root Task ID: ${result.lineage.rootTaskId}`,
+        `Parent Task ID: ${result.lineage.parentTaskId ?? "(none)"}`,
+        `Revision Number: ${result.lineage.revisionNumber}`,
         `Prompt mode: ${result.promptMode}`,
         `Recommended Claude skill: ${result.claudeSkill ? `/${result.claudeSkill}` : "(none)"}`,
         `Task file for Claude: ${result.taskFilePath}`,
@@ -2532,6 +2541,16 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         target: result.target,
         title: result.title,
         status: result.status,
+        lineage: {
+          root_task_id: result.lineage.rootTaskId,
+          parent_task_id: result.lineage.parentTaskId,
+          revision_number: result.lineage.revisionNumber,
+          source_verification_signature:
+            result.lineage.sourceVerificationSignature,
+          source_execution_result_digest:
+            result.lineage.sourceExecutionResultDigest,
+          source_verdict: result.lineage.sourceVerdict
+        },
       
         prompt_mode: result.promptMode,
         claude_skill: result.claudeSkill,
@@ -2906,6 +2925,9 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         `Task ID: ${result.taskId}`,
         `Title: ${result.title}`,
         `Dispatch status: ${result.dispatchStatus}`,
+        `Root Task ID: ${result.lineage.rootTaskId}`,
+        `Parent Task ID: ${result.lineage.parentTaskId ?? "(none)"}`,
+        `Revision Number: ${result.lineage.revisionNumber}`,
         `Result status: ${result.result.status}`,
         `Execution result digest: ${result.result.digest ?? "(unavailable)"}`,
         `Stored verification: ${result.verification.record.state}`,
@@ -3009,6 +3031,17 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
   
         dispatch_status:
           result.dispatchStatus,
+
+        lineage: {
+          root_task_id: result.lineage.rootTaskId,
+          parent_task_id: result.lineage.parentTaskId,
+          revision_number: result.lineage.revisionNumber,
+          source_verification_signature:
+            result.lineage.sourceVerificationSignature,
+          source_execution_result_digest:
+            result.lineage.sourceExecutionResultDigest,
+          source_verdict: result.lineage.sourceVerdict
+        },
   
         target: result.target,
   
@@ -3614,6 +3647,292 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         json_payload: result.jsonPayload,
         verification_markdown: result.markdown,
         writes: result.writes,
+        audit: result.audit,
+        safety: result.safety
+      });
+    }
+  );
+
+
+  registerCodexTool(
+    config,
+    server,
+    "create_review_revision_task",
+    {
+      title: "Create Review Revision Task",
+      description:
+        "Preview or explicitly create the next draft Review Execution Task from the current, non-stale revision_required WebGPT Verification. " +
+        "The tool archives the completed source round under .ai-bridge/review-rounds/, records linear task lineage, and requires every unresolved Verification source item to be covered or explicitly deferred. " +
+        "Default confirmed=false. It never dispatches the new task, sends Claude Code input, submits Enter, confirms permissions, runs tests, or starts an automatic loop.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe(
+          "Workspace id from open_workspace. Omit to use the default workspace."
+        ),
+        source_task_id: z.string().min(1).max(200).describe(
+          "Exact task_id of the current task whose recorded Verification is revision_required."
+        ),
+        source_verification_signature: z
+          .string()
+          .regex(/^[a-fA-F0-9]{64}$/)
+          .describe(
+            "Exact verification_signature from the current webgpt-verification-result.json."
+          ),
+        title: z.string().min(1).max(160).describe(
+          "Short title for the next revision task."
+        ),
+        revision_goal: z.string().min(1).max(8000).describe(
+          "What the next manual revision round must fix or verify."
+        ),
+        findings: z
+          .array(
+            z.object({
+              source_type: z.enum([
+                "finding",
+                "test",
+                "remaining_issue",
+                "risk",
+                "file_scope",
+                "forbidden_action",
+                "manual"
+              ]),
+              source_index: z.number().int().min(1).optional(),
+              source_path: z.string().min(1).max(2000).optional(),
+              source_code: z.string().min(1).max(500).optional(),
+              file: z.string().min(1).max(2000).optional(),
+              issue: z.string().min(1).max(4000),
+              recommendation: z.string().min(1).max(4000),
+              priority: z.enum(["low", "medium", "high"]).optional(),
+              risk: z.string().max(2000).optional()
+            })
+          )
+          .min(1)
+          .max(100)
+          .describe(
+            "Revision findings. Non-manual findings must reference a currently unresolved Verification source item."
+          ),
+        deferred_source_items: z
+          .array(
+            z.object({
+              source_type: z.enum([
+                "finding",
+                "test",
+                "remaining_issue",
+                "risk",
+                "file_scope",
+                "forbidden_action"
+              ]),
+              source_index: z.number().int().min(1).optional(),
+              source_path: z.string().min(1).max(2000).optional(),
+              source_code: z.string().min(1).max(500).optional(),
+              reason: z.string().min(1).max(4000)
+            })
+          )
+          .max(300)
+          .optional()
+          .describe(
+            "Unresolved Verification source items intentionally deferred from this revision round, each with a reason."
+          ),
+        reviewed_files: z
+          .array(z.string().min(1).max(2000))
+          .max(300)
+          .optional(),
+        allowed_files: z
+          .array(z.string().min(1).max(2000))
+          .max(300)
+          .optional(),
+        forbidden_actions: z
+          .array(z.string().min(1).max(4000))
+          .max(300)
+          .optional(),
+        test_instructions: z
+          .array(z.string().min(1).max(4000))
+          .max(100)
+          .optional(),
+        extra_context: z.string().max(10000).optional(),
+        target: z.string().min(1).max(80).optional().describe(
+          "Optional allowlisted Claude Code target for the new draft task."
+        ),
+        prompt_mode: z
+          .enum(["inline", "file_reference", "skill_file_reference"])
+          .optional(),
+        claude_skill: z.string().min(1).max(128).optional(),
+        task_file_for_claude: z
+          .enum(["execution_task", "review_plan"])
+          .optional(),
+        confirmed: z.boolean().optional().describe(
+          "Explicit confirmation to archive the source round and create the next draft task. Default false: preview only."
+        )
+      },
+      annotations: HANDOFF_WRITE_ANNOTATIONS,
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Preparing review revision task...",
+        "openai/toolInvocation/invoked": "Review revision task processed"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const result = await createReviewRevisionTask(
+        config,
+        guard,
+        workspace,
+        {
+          sourceTaskId: String(args.source_task_id ?? ""),
+          sourceVerificationSignature: String(
+            args.source_verification_signature ?? ""
+          ),
+          title: String(args.title ?? ""),
+          revisionGoal: String(args.revision_goal ?? ""),
+          findings: Array.isArray(args.findings)
+            ? args.findings.map((item: any) => ({
+                sourceType: item.source_type,
+                sourceIndex:
+                  typeof item.source_index === "number"
+                    ? item.source_index
+                    : undefined,
+                sourcePath:
+                  typeof item.source_path === "string"
+                    ? item.source_path
+                    : undefined,
+                sourceCode:
+                  typeof item.source_code === "string"
+                    ? item.source_code
+                    : undefined,
+                file:
+                  typeof item.file === "string"
+                    ? item.file
+                    : undefined,
+                issue: String(item.issue ?? ""),
+                recommendation: String(item.recommendation ?? ""),
+                priority: item.priority,
+                risk:
+                  typeof item.risk === "string"
+                    ? item.risk
+                    : undefined
+              }))
+            : [],
+          deferredSourceItems: Array.isArray(args.deferred_source_items)
+            ? args.deferred_source_items.map((item: any) => ({
+                sourceType: item.source_type,
+                sourceIndex:
+                  typeof item.source_index === "number"
+                    ? item.source_index
+                    : undefined,
+                sourcePath:
+                  typeof item.source_path === "string"
+                    ? item.source_path
+                    : undefined,
+                sourceCode:
+                  typeof item.source_code === "string"
+                    ? item.source_code
+                    : undefined,
+                reason: String(item.reason ?? "")
+              }))
+            : undefined,
+          reviewedFiles: Array.isArray(args.reviewed_files)
+            ? args.reviewed_files.map(String)
+            : undefined,
+          allowedFiles: Array.isArray(args.allowed_files)
+            ? args.allowed_files.map(String)
+            : undefined,
+          forbiddenActions: Array.isArray(args.forbidden_actions)
+            ? args.forbidden_actions.map(String)
+            : undefined,
+          testInstructions: Array.isArray(args.test_instructions)
+            ? args.test_instructions.map(String)
+            : undefined,
+          extraContext:
+            typeof args.extra_context === "string"
+              ? args.extra_context
+              : undefined,
+          target:
+            typeof args.target === "string"
+              ? args.target
+              : undefined,
+          promptMode:
+            args.prompt_mode === "inline" ||
+            args.prompt_mode === "file_reference" ||
+            args.prompt_mode === "skill_file_reference"
+              ? args.prompt_mode
+              : undefined,
+          claudeSkill:
+            typeof args.claude_skill === "string"
+              ? args.claude_skill
+              : undefined,
+          taskFileForClaude:
+            args.task_file_for_claude === "review_plan" ||
+            args.task_file_for_claude === "execution_task"
+              ? args.task_file_for_claude
+              : undefined,
+          confirmed: args.confirmed === true
+        }
+      );
+
+      const action = result.created
+        ? result.idempotent
+          ? "Revision task already exists; duplicate creation skipped"
+          : "Revision task created"
+        : "Preview only; no archive, task files, or audit event were written";
+
+      const text = [
+        "# Review Revision Task",
+        "",
+        `Action: ${action}`,
+        `Source Task ID: ${result.sourceTaskId}`,
+        `New Task ID: ${result.newTaskId}`,
+        `Root Task ID: ${result.rootTaskId}`,
+        `Parent Task ID: ${result.parentTaskId}`,
+        `Revision Number: ${result.revisionNumber}`,
+        `Confirmed: ${result.confirmed}`,
+        `Can create: ${result.canCreate}`,
+        `Created: ${result.created}`,
+        `Idempotent: ${result.idempotent}`,
+        `Source Verification Signature: ${result.sourceVerificationSignature}`,
+        `Source Execution Result Digest: ${result.sourceExecutionResultDigest}`,
+        `Request Signature: ${result.requestSignature}`,
+        `Archive: ${result.archive.directory}`,
+        `Manifest: ${result.archive.manifestPath}`,
+        "",
+        "## Source Accounting",
+        "",
+        `Covered: ${result.coveredSourceItems.length}`,
+        `Deferred: ${result.deferredSourceItems.length}`,
+        `Unaccounted: ${result.unaccountedSourceItems.length}`,
+        ...result.unaccountedSourceItems.map(
+          (item) => `- UNACCOUNTED ${item.key}: ${item.label}`
+        ),
+        "",
+        result.created
+          ? "The new task remains draft. Preview and confirm dispatch separately with dispatch_review_execution_task."
+          : "Review this preview with the user. Set confirmed=true only after explicit confirmation.",
+        "",
+        "No Claude Code input was sent and no automatic revision loop was started."
+      ].join("\n");
+
+      return textResult(text, {
+        workspace_id: workspace.id,
+        root: workspace.root,
+        source_task_id: result.sourceTaskId,
+        source_verification_signature:
+          result.sourceVerificationSignature,
+        source_execution_result_digest:
+          result.sourceExecutionResultDigest,
+        request_signature: result.requestSignature,
+        new_task_id: result.newTaskId,
+        lineage: {
+          root_task_id: result.rootTaskId,
+          parent_task_id: result.parentTaskId,
+          revision_number: result.revisionNumber
+        },
+        confirmed: result.confirmed,
+        created: result.created,
+        idempotent: result.idempotent,
+        can_create: result.canCreate,
+        covered_source_items: result.coveredSourceItems,
+        deferred_source_items: result.deferredSourceItems,
+        unaccounted_source_items: result.unaccountedSourceItems,
+        archive: result.archive,
+        task: result.task,
         audit: result.audit,
         safety: result.safety
       });

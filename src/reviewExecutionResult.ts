@@ -21,7 +21,8 @@ import {
 import {
   readStoredReviewExecutionTask,
   type ReviewExecutionFindingInput,
-  type ReviewExecutionTaskLifecycleStatus
+  type ReviewExecutionTaskLifecycleStatus,
+  type ReviewTaskLineage
 } from "./reviewExecutionTask.js";
 
 export type ClaudeExecutionResultStatus =
@@ -81,6 +82,7 @@ export interface InspectReviewExecutionResultResult {
   title: string;
 
   dispatchStatus: ReviewExecutionTaskLifecycleStatus;
+  lineage: ReviewTaskLineage;
 
   target: string | null;
 
@@ -1462,6 +1464,9 @@ export async function inspectReviewExecutionResult(
         task_id: task.taskId,
 
         dispatch_status: task.status,
+        root_task_id: task.lineage.rootTaskId,
+        parent_task_id: task.lineage.parentTaskId,
+        revision_number: task.lineage.revisionNumber,
 
         result_status: parsedResult.status,
         execution_result_digest: parsedResult.digest,
@@ -1491,6 +1496,7 @@ export async function inspectReviewExecutionResult(
     title: task.title,
 
     dispatchStatus: task.status,
+    lineage: task.lineage,
 
     target,
 

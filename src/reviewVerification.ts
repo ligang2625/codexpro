@@ -121,6 +121,24 @@ export interface RecordReviewVerificationInput {
   confirmed?: boolean;
 }
 
+
+export interface StoredReviewVerification {
+  jsonPath: string;
+  payload: Record<string, unknown>;
+  schemaVersion: number;
+  taskId: string;
+  executionResultDigest: string;
+  verificationSignature: string;
+  verdict: WebGPTVerificationVerdict;
+  summary: string;
+  findingResults: Array<Record<string, unknown>>;
+  testEvidence: Array<Record<string, unknown>>;
+  remainingIssueResults: Array<Record<string, unknown>>;
+  riskResults: Array<Record<string, unknown>>;
+  fileReview: Record<string, unknown>;
+  forbiddenActionViolations: string[];
+}
+
 export interface VerificationAcceptanceCheck {
   code: string;
   passed: boolean;
@@ -1324,6 +1342,107 @@ async function appendVerificationHistory(
   }
 }
 
+
+function storedObjectArray(value: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(value)) return [];
+
+  return value.filter(
+    (item): item is Record<string, unknown> =>
+      Boolean(item) && typeof item === "object" && !Array.isArray(item)
+  );
+}
+
+export async function readStoredReviewVerification(
+  config: CodexProConfig,
+  guard: PathGuard,
+  workspace: Workspace,
+  jsonPath: string,
+  expectedTaskId?: string
+): Promise<StoredReviewVerification> {
+  const resolved = guard.resolve(workspace, jsonPath);
+
+  await guard.assertTextFile(
+    resolved.absPath,
+    Math.min(config.maxReadBytes, 1_000_000)
+  );
+
+  let parsed: unknown;
+
+  try {
+    parsed = JSON.parse(
+      await fsp.readFile(resolved.absPath, "utf8")
+    );
+  } catch (error) {
+    throw new CodexProError(
+      `Invalid verification JSON in ${jsonPath}: ${errorMessage(error)}`
+    );
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new CodexProError(
+      `Invalid verification payload in ${jsonPath}.`
+    );
+  }
+
+  const payload = parsed as Record<string, unknown>;
+
+  if (payload.kind !== "webgpt_review_verification") {
+    throw new CodexProError(
+      "Verification kind must be webgpt_review_verification."
+    );
+  }
+
+  const schemaVersion = Number(payload.schema_version ?? 1);
+  if (!Number.isInteger(schemaVersion) || schemaVersion !== 1) {
+    throw new CodexProError(
+      `Unsupported verification schema_version: ${String(payload.schema_version)}`
+    );
+  }
+
+  const taskId = cleanText(payload.task_id, "verification.task_id", 200);
+  if (expectedTaskId && taskId !== expectedTaskId) {
+    throw new CodexProError(
+      `Verification task_id does not match the current task. Expected ${expectedTaskId}, received ${taskId}.`
+    );
+  }
+
+  const executionResultDigest = normalizeDigest(
+    payload.execution_result_digest
+  );
+  const verificationSignature = normalizeDigest(
+    payload.verification_signature
+  );
+  const verdict = normalizeVerdict(payload.verdict);
+
+  return {
+    jsonPath,
+    payload,
+    schemaVersion,
+    taskId,
+    executionResultDigest,
+    verificationSignature,
+    verdict,
+    summary: String(payload.summary ?? "").trim(),
+    findingResults: storedObjectArray(payload.finding_results),
+    testEvidence: storedObjectArray(payload.test_evidence),
+    remainingIssueResults: storedObjectArray(payload.remaining_issue_results),
+    riskResults: storedObjectArray(payload.risk_results),
+    fileReview:
+      payload.file_review &&
+      typeof payload.file_review === "object" &&
+      !Array.isArray(payload.file_review)
+        ? payload.file_review as Record<string, unknown>
+        : {},
+    forbiddenActionViolations: Array.isArray(
+      payload.forbidden_action_violations
+    )
+      ? payload.forbidden_action_violations
+          .map((item) => String(item ?? "").trim())
+          .filter(Boolean)
+      : []
+  };
+}
+
 async function readExistingSignature(
   config: CodexProConfig,
   guard: PathGuard,
@@ -1695,6 +1814,17 @@ export async function recordReviewVerification(
     },
 
     forbidden_action_violations: forbiddenActionViolations,
+
+    task_lineage: {
+      root_task_id: task.lineage.rootTaskId,
+      parent_task_id: task.lineage.parentTaskId,
+      revision_number: task.lineage.revisionNumber,
+      source_verification_signature:
+        task.lineage.sourceVerificationSignature,
+      source_execution_result_digest:
+        task.lineage.sourceExecutionResultDigest,
+      source_verdict: task.lineage.sourceVerdict
+    },
 
     execution_result_snapshot: {
       status: result.status,
